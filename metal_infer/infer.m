@@ -246,6 +246,8 @@ static void load_model_config(const char *model_dir) {
     cfg.rms_norm_eps     = [tc[@"rms_norm_eps"] floatValue];
     cfg.num_experts      = [tc[@"num_experts"] intValue];
     cfg.num_experts_per_tok = [tc[@"num_experts_per_tok"] intValue];
+    // Experiment: reduce routed experts from K=8 to K=4 to cut per-token expert I/O.
+    if (cfg.num_experts_per_tok > 4) cfg.num_experts_per_tok = 4;
     cfg.moe_intermediate = [tc[@"moe_intermediate_size"] intValue];
     cfg.shared_intermediate = [tc[@"shared_expert_intermediate_size"] intValue];
     cfg.linear_num_v_heads = [tc[@"linear_num_value_heads"] intValue];
@@ -3303,7 +3305,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 8  // 8 threads for K=8 experts (one per expert)
+#define NUM_IO_THREADS 6  // Experiment: reduce I/O thread contention on M4
 
 typedef struct {
     int fd;
