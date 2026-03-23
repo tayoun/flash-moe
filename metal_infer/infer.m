@@ -5466,7 +5466,20 @@ static void fused_layer_forward(
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = cfg.group_size;
             int use_v3 = (o_in_dim <= 4096 && g_metal->matvec_v3 != nil);
-            [enc setComputePipelineState:use_v3 ? g_metal->matvec_v3 : g_metal->matvec_fast];
+            uint32_t rows_per_tg = 8;
+            uint32_t threads_per_tg = 256;
+            id<MTLComputePipelineState> oproj_pipe = g_metal->matvec_fast;
+            if (use_v3) {
+                // M4 heuristic for full-attn o_proj (2048x2048): prefer tg128 for occupancy.
+                if (g_metal->matvec_v3_tg128 && o_in_dim >= 2048 && o_out_dim <= 2048) {
+                    rows_per_tg = 4;
+                    threads_per_tg = 128;
+                    oproj_pipe = g_metal->matvec_v3_tg128;
+                } else {
+                    oproj_pipe = g_metal->matvec_v3;
+                }
+            }
+            [enc setComputePipelineState:oproj_pipe];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
             [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
             [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
@@ -5476,9 +5489,9 @@ static void fused_layer_forward(
             [enc setBytes:&o_in_dim   length:4 atIndex:6];
             [enc setBytes:&o_gs       length:4 atIndex:7];
             if (use_v3) {
-                uint32_t num_tgs = (o_out_dim + 7) / 8;
+                uint32_t num_tgs = (o_out_dim + rows_per_tg - 1) / rows_per_tg;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
             } else {
                 [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
