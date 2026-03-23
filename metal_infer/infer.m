@@ -65,6 +65,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
 #include <compression.h>
 
 // ============================================================================
@@ -3446,6 +3447,7 @@ static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+    (void)mmap_base;
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
@@ -3463,14 +3465,92 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         g_async_pread.tasks[k].result = 0;
     }
 
-    // Fire off parallel preads on GCD — returns immediately
+    // Fire off async reads on GCD and return immediately.
+    // Coalesce adjacent expert offsets into one preadv() when possible.
+    // This reduces syscall overhead and can improve NVMe sequential read behavior.
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    for (int k = 0; k < K; k++) {
-        InferPreadTask *t = &g_async_pread.tasks[k];
+
+    int order[MAX_K];
+    for (int i = 0; i < K; i++) order[i] = i;
+    for (int i = 1; i < K; i++) {
+        int key = order[i];
+        off_t key_off = g_async_pread.tasks[key].offset;
+        int j = i - 1;
+        while (j >= 0 && g_async_pread.tasks[order[j]].offset > key_off) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    typedef struct {
+        InferPreadTask *tasks;
+        int idx[MAX_K];
+        int count;
+    } AsyncRun;
+
+    int run_start = 0;
+    while (run_start < K) {
+        int run_end = run_start + 1;
+        while (run_end < K) {
+            int prev_slot = order[run_end - 1];
+            int cur_slot = order[run_end];
+            off_t expected = g_async_pread.tasks[prev_slot].offset + (off_t)esz;
+            if (g_async_pread.tasks[cur_slot].offset != expected) break;
+            run_end++;
+        }
+
+        AsyncRun *run = malloc(sizeof(AsyncRun));
+        run->tasks = g_async_pread.tasks;
+        run->count = run_end - run_start;
+        for (int i = 0; i < run->count; i++) {
+            run->idx[i] = order[run_start + i];
+        }
+
         dispatch_group_async(g_async_pread.group, io_q, ^{
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
+            if (run->count == 1) {
+                InferPreadTask *t = &run->tasks[run->idx[0]];
+                t->result = pread(t->fd, t->dst, t->size, t->offset);
+                free(run);
+                return;
+            }
+
+            struct iovec iov[MAX_K];
+            int base_slot = run->idx[0];
+            InferPreadTask *base = &run->tasks[base_slot];
+            for (int i = 0; i < run->count; i++) {
+                InferPreadTask *t = &run->tasks[run->idx[i]];
+                iov[i].iov_base = t->dst;
+                iov[i].iov_len = t->size;
+            }
+
+            ssize_t nr = preadv(base->fd, iov, run->count, base->offset);
+            if (nr < 0) {
+                for (int i = 0; i < run->count; i++) {
+                    run->tasks[run->idx[i]].result = -1;
+                }
+                free(run);
+                return;
+            }
+
+            ssize_t remain = nr;
+            for (int i = 0; i < run->count; i++) {
+                InferPreadTask *t = &run->tasks[run->idx[i]];
+                if (remain >= (ssize_t)t->size) {
+                    t->result = (ssize_t)t->size;
+                    remain -= (ssize_t)t->size;
+                } else if (remain > 0) {
+                    t->result = remain;
+                    remain = 0;
+                } else {
+                    t->result = 0;
+                }
+            }
+            free(run);
         });
+
+        run_start = run_end;
     }
 }
 
