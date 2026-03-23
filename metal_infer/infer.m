@@ -1220,6 +1220,7 @@ typedef struct {
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
     id<MTLComputePipelineState> matvec_v3;
+    id<MTLComputePipelineState> matvec_v3_tg128;  // M4 occupancy variant (128 threads / 4 rows)
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
@@ -1363,6 +1364,7 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec_v3_tg128 = makePipe(@"dequant_matvec_4bit_v3_tg128");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
@@ -1814,6 +1816,19 @@ static void gpu_flush_batch_results(MetalCtx *ctx, BatchMatvecSpec *specs, int n
     }
 }
 
+static inline id<MTLComputePipelineState> select_4bit_expert_matvec_pipe(
+    MetalCtx *ctx, uint32_t in_dim, uint32_t *rows_per_tg, uint32_t *threads_per_tg
+) {
+    if (ctx->matvec_v3_tg128 && in_dim <= 4096) {
+        *rows_per_tg = 4;
+        *threads_per_tg = 128;
+        return ctx->matvec_v3_tg128;
+    }
+    *rows_per_tg = 8;
+    *threads_per_tg = 256;
+    return ctx->matvec_v3;
+}
+
 // Encode a single matvec reading from buf_expert_act into buf_expert_out,
 // using weight pointers into the mmap'd weight file.
 // Used for shared expert down_proj which reads from a different input than
@@ -1830,8 +1845,12 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    uint32_t rows_per_tg = 8, threads_per_tg = 256;
+    id<MTLComputePipelineState> matvec_pipe = ctx->matvec_fast;
+    if (in_dim <= 4096) {
+        matvec_pipe = select_4bit_expert_matvec_pipe(ctx, in_dim, &rows_per_tg, &threads_per_tg);
+    }
+    [enc setComputePipelineState:matvec_pipe];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
     [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
@@ -1841,10 +1860,10 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&in_dim      length:4     atIndex:6];
     [enc setBytes:&group_size  length:4     atIndex:7];
 
-    if (use_v3) {
-        uint32_t num_tgs = (out_dim + 7) / 8;
+    if (in_dim <= 4096) {
+        uint32_t num_tgs = (out_dim + rows_per_tg - 1) / rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
     } else {
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -1872,18 +1891,27 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
-
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
     uint32_t down_out    = cfg.hidden_dim;
     uint32_t down_in     = cfg.moe_intermediate;
     uint32_t gs          = cfg.group_size;
+    uint32_t gate_rows_per_tg = 8, gate_threads_per_tg = 256;
+    uint32_t down_rows_per_tg = 8, down_threads_per_tg = 256;
+    id<MTLComputePipelineState> gate_pipe = nil;
+    id<MTLComputePipelineState> down_pipe = nil;
+    if (g_use_2bit) {
+        gate_pipe = ctx->matvec_2bit;
+        down_pipe = ctx->matvec_2bit;
+    } else {
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+    }
 
     // gate_proj: data[k] -> gate[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:gate_pipe];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_b_off  atIndex:2];
@@ -1892,15 +1920,15 @@ static void gpu_encode_expert_forward_slot(
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        uint32_t num_tgs = (gate_up_out + gate_rows_per_tg - 1) / gate_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
     // up_proj: data[k] -> up[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:gate_pipe];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:up_b_off  atIndex:2];
@@ -1909,9 +1937,9 @@ static void gpu_encode_expert_forward_slot(
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        uint32_t num_tgs = (gate_up_out + gate_rows_per_tg - 1) / gate_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
     // SwiGLU: gate[k], up[k] -> act[k]
@@ -1930,7 +1958,7 @@ static void gpu_encode_expert_forward_slot(
     // down_proj: act[k] -> out[k]
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:down_pipe];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_b_off  atIndex:2];
@@ -1939,9 +1967,9 @@ static void gpu_encode_expert_forward_slot(
         [enc setBytes:&down_out length:4 atIndex:5];
         [enc setBytes:&down_in  length:4 atIndex:6];
         [enc setBytes:&gs       length:4 atIndex:7];
-        uint32_t num_tgs = (down_out + 7) / 8;
+        uint32_t num_tgs = (down_out + down_rows_per_tg - 1) / down_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(down_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
 }
@@ -1968,18 +1996,27 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
-
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
     uint32_t down_out    = cfg.hidden_dim;
     uint32_t down_in     = cfg.moe_intermediate;
     uint32_t gs          = cfg.group_size;
+    uint32_t gate_rows_per_tg = 8, gate_threads_per_tg = 256;
+    uint32_t down_rows_per_tg = 8, down_threads_per_tg = 256;
+    id<MTLComputePipelineState> gate_pipe = nil;
+    id<MTLComputePipelineState> down_pipe = nil;
+    if (g_use_2bit) {
+        gate_pipe = ctx->matvec_2bit;
+        down_pipe = ctx->matvec_2bit;
+    } else {
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+    }
 
     // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:gate_pipe];
         [enc setBuffer:data_buf                        offset:gate_w_off  atIndex:0];
         [enc setBuffer:data_buf                        offset:gate_s_off  atIndex:1];
         [enc setBuffer:data_buf                        offset:gate_b_off  atIndex:2];
@@ -1988,15 +2025,15 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        uint32_t num_tgs = (gate_up_out + gate_rows_per_tg - 1) / gate_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
     // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:gate_pipe];
         [enc setBuffer:data_buf                        offset:up_w_off  atIndex:0];
         [enc setBuffer:data_buf                        offset:up_s_off  atIndex:1];
         [enc setBuffer:data_buf                        offset:up_b_off  atIndex:2];
@@ -2005,9 +2042,9 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc setBytes:&gate_up_out length:4 atIndex:5];
         [enc setBytes:&gate_up_in  length:4 atIndex:6];
         [enc setBytes:&gs          length:4 atIndex:7];
-        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        uint32_t num_tgs = (gate_up_out + gate_rows_per_tg - 1) / gate_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
     // SwiGLU
@@ -2026,7 +2063,7 @@ static void gpu_encode_expert_forward_slot_buf(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:down_pipe];
         [enc setBuffer:data_buf                        offset:down_w_off  atIndex:0];
         [enc setBuffer:data_buf                        offset:down_s_off  atIndex:1];
         [enc setBuffer:data_buf                        offset:down_b_off  atIndex:2];
@@ -2035,9 +2072,9 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc setBytes:&down_out length:4 atIndex:5];
         [enc setBytes:&down_in  length:4 atIndex:6];
         [enc setBytes:&gs       length:4 atIndex:7];
-        uint32_t num_tgs = (down_out + 7) / 8;
+        uint32_t num_tgs = (down_out + down_rows_per_tg - 1) / down_rows_per_tg;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(down_threads_per_tg, 1, 1)];
         [enc endEncoding];
     }
 }
@@ -2068,18 +2105,27 @@ static void gpu_encode_experts_batched(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
-
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
     uint32_t down_out    = cfg.hidden_dim;
     uint32_t down_in     = cfg.moe_intermediate;
     uint32_t gs          = cfg.group_size;
+    uint32_t gate_rows_per_tg = 8, gate_threads_per_tg = 256;
+    uint32_t down_rows_per_tg = 8, down_threads_per_tg = 256;
+    id<MTLComputePipelineState> gate_pipe = nil;
+    id<MTLComputePipelineState> down_pipe = nil;
+    if (g_use_2bit) {
+        gate_pipe = ctx->matvec_2bit;
+        down_pipe = ctx->matvec_2bit;
+    } else {
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+    }
     // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
     // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
     // Threadgroup count is the same (based on out_dim), kernel handles packed_cols internally.
-    uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
-    uint32_t down_tgs    = (down_out + 7) / 8;
+    uint32_t gate_up_tgs = (gate_up_out + gate_rows_per_tg - 1) / gate_rows_per_tg;
+    uint32_t down_tgs    = (down_out + down_rows_per_tg - 1) / down_rows_per_tg;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
     // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
@@ -2092,7 +2138,7 @@ static void gpu_encode_experts_batched(
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
             // gate_proj
-            [enc setComputePipelineState:expert_pipe];
+            [enc setComputePipelineState:gate_pipe];
             [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
@@ -2102,14 +2148,14 @@ static void gpu_encode_experts_batched(
             [enc setBytes:&gate_up_in  length:4 atIndex:6];
             [enc setBytes:&gs          length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
             // up_proj (same encoder, serialized after gate — shares encoder overhead)
             [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
             [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(gate_threads_per_tg, 1, 1)];
             [enc endEncoding];
         }
 
@@ -2125,7 +2171,7 @@ static void gpu_encode_experts_batched(
             [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             // down_proj (same encoder, serialized after SwiGLU)
-            [enc setComputePipelineState:expert_pipe];
+            [enc setComputePipelineState:down_pipe];
             [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
@@ -2135,7 +2181,7 @@ static void gpu_encode_experts_batched(
             [enc setBytes:&down_in  length:4 atIndex:6];
             [enc setBytes:&gs       length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(down_threads_per_tg, 1, 1)];
             [enc endEncoding];
         }
     }

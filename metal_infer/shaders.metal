@@ -339,6 +339,83 @@ kernel void dequant_matvec_4bit_v3(
     }
 }
 
+// ============================================================================
+// Kernel 1c-b: v3 variant tuned for smaller GPUs (128 threads / 4 rows per TG)
+// ============================================================================
+//
+// M4 10-core can prefer smaller threadgroups for better occupancy/latency.
+// This variant keeps the same math path as v3 (including FMA dequant) but uses:
+//   - 128 threads per threadgroup (4 SIMD groups)
+//   - 4 output rows per threadgroup (one row per SIMD group)
+//
+// Dispatch rule: num_tgs = ceil(out_dim / 4), threadsPerThreadgroup = 128
+
+#define ROWS_PER_TG_128 4
+
+kernel void dequant_matvec_4bit_v3_tg128(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG_128 + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 128) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
 
 // ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
