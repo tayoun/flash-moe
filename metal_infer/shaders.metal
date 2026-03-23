@@ -1089,7 +1089,6 @@ kernel void attn_values_batched(
     device const float* scores   [[buffer(0)]],  // [num_heads, seq_stride]
     device const float* V_cache  [[buffer(1)]],  // [max_seq, kv_dim]
     device float*       out      [[buffer(2)]],  // [num_heads, head_dim]
-    device const float* gate     [[buffer(8)]],  // [num_heads, head_dim]
     constant uint&      head_dim  [[buffer(3)]],  // 256
     constant uint&      kv_dim    [[buffer(4)]],  // 512
     constant uint&      seq_len   [[buffer(5)]],
@@ -1107,9 +1106,7 @@ kernel void attn_values_batched(
     for (uint p = 0; p < seq_len; p++) {
         acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
     }
-    uint idx = h * head_dim + d;
-    float g = 1.0f / (1.0f + exp(-gate[idx]));
-    out[idx] = acc * g;
+    out[h * head_dim + d] = acc;
 }
 
 
