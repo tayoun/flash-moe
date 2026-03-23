@@ -1817,9 +1817,11 @@ static void gpu_flush_batch_results(MetalCtx *ctx, BatchMatvecSpec *specs, int n
 }
 
 static inline id<MTLComputePipelineState> select_4bit_expert_matvec_pipe(
-    MetalCtx *ctx, uint32_t in_dim, uint32_t *rows_per_tg, uint32_t *threads_per_tg
+    MetalCtx *ctx, uint32_t out_dim, uint32_t in_dim, uint32_t *rows_per_tg, uint32_t *threads_per_tg
 ) {
-    if (ctx->matvec_v3_tg128 && in_dim <= 4096) {
+    // M4-specific heuristic: use 128-thread variant for gate/up style shapes
+    // (high in_dim, small out_dim), keep default v3 for down_proj.
+    if (ctx->matvec_v3_tg128 && in_dim >= 2048 && out_dim <= 1024) {
         *rows_per_tg = 4;
         *threads_per_tg = 128;
         return ctx->matvec_v3_tg128;
@@ -1848,7 +1850,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     uint32_t rows_per_tg = 8, threads_per_tg = 256;
     id<MTLComputePipelineState> matvec_pipe = ctx->matvec_fast;
     if (in_dim <= 4096) {
-        matvec_pipe = select_4bit_expert_matvec_pipe(ctx, in_dim, &rows_per_tg, &threads_per_tg);
+        matvec_pipe = select_4bit_expert_matvec_pipe(ctx, out_dim, in_dim, &rows_per_tg, &threads_per_tg);
     }
     [enc setComputePipelineState:matvec_pipe];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
@@ -1904,8 +1906,8 @@ static void gpu_encode_expert_forward_slot(
         gate_pipe = ctx->matvec_2bit;
         down_pipe = ctx->matvec_2bit;
     } else {
-        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
-        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_out, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_out, down_in, &down_rows_per_tg, &down_threads_per_tg);
     }
 
     // gate_proj: data[k] -> gate[k]
@@ -2009,8 +2011,8 @@ static void gpu_encode_expert_forward_slot_buf(
         gate_pipe = ctx->matvec_2bit;
         down_pipe = ctx->matvec_2bit;
     } else {
-        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
-        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_out, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_out, down_in, &down_rows_per_tg, &down_threads_per_tg);
     }
 
     // gate_proj
@@ -2118,8 +2120,8 @@ static void gpu_encode_experts_batched(
         gate_pipe = ctx->matvec_2bit;
         down_pipe = ctx->matvec_2bit;
     } else {
-        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
-        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_in, &down_rows_per_tg, &down_threads_per_tg);
+        gate_pipe = select_4bit_expert_matvec_pipe(ctx, gate_up_out, gate_up_in, &gate_rows_per_tg, &gate_threads_per_tg);
+        down_pipe = select_4bit_expert_matvec_pipe(ctx, down_out, down_in, &down_rows_per_tg, &down_threads_per_tg);
     }
     // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
     // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
