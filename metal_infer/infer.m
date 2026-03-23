@@ -1155,6 +1155,20 @@ static int cpu_argmax(const float *x, int dim) {
     return best;
 }
 
+// Argmax while excluding one token id (cheap anti-loop fallback).
+static int cpu_argmax_excluding(const float *x, int dim, int banned_id) {
+    int best = -1;
+    float best_val = -INFINITY;
+    for (int i = 0; i < dim; i++) {
+        if (i == banned_id) continue;
+        if (best < 0 || x[i] > best_val) {
+            best_val = x[i];
+            best = i;
+        }
+    }
+    return (best >= 0) ? best : 0;
+}
+
 // SiLU activation
 static void cpu_silu(float *x, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -6793,6 +6807,8 @@ static void serve_loop(
             int in_think = 0;
             int think_tokens = 0;
             int client_alive = 1;
+            int prev_token = -1;
+            int repeat_run = 0;
 
             // Accumulate response for session persistence
             char *gen_response = calloc(1, 256 * 1024);
@@ -6800,6 +6816,18 @@ static void serve_loop(
 
             // Stream first token immediately after first logits are ready
             for (int gen = 0; gen < max_gen; gen++) {
+                if (next_token == prev_token) repeat_run++;
+                else { prev_token = next_token; repeat_run = 1; }
+                // Break pathological loops like "!!!!!!!!" by forcing next-best token.
+                if (repeat_run >= 16) {
+                    int alt = cpu_argmax_excluding(logits, cfg.vocab_size, next_token);
+                    if (alt != next_token) {
+                        next_token = alt;
+                        prev_token = alt;
+                        repeat_run = 1;
+                    }
+                }
+
                 if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
                     // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
