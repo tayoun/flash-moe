@@ -4064,7 +4064,6 @@ static void malloc_cache_free(MallocExpertCache *cache) {
 typedef struct {
     void *dst[MAX_K];       // raw pointers from [buf contents] (no ARC)
     off_t offset[MAX_K];    // file offsets per expert
-    int slot[MAX_K];        // original expert slot for each sorted task
     int K;                  // number of experts
     int fd;                 // file descriptor for this layer
     int valid[MAX_K];       // output: 1 if pread succeeded
@@ -4111,9 +4110,8 @@ static void *infer_prefetch_thread_fn(void *arg) {
 
         plan->loaded = 0;
         for (int k = 0; k < plan->K; k++) {
-            int slot = plan->slot[k];
-            plan->valid[slot] = (tasks[k].result == (ssize_t)esz);
-            if (plan->valid[slot]) plan->loaded++;
+            plan->valid[k] = (tasks[k].result == (ssize_t)esz);
+            if (plan->valid[k]) plan->loaded++;
         }
 
         // Signal completion
@@ -4139,25 +4137,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [dst_bufs[k] contents];
         plan->offset[k] = (off_t)expert_indices[k] * esz;
-        plan->slot[k] = k;
         plan->valid[k] = 0;
-    }
-    // Read experts in ascending file-offset order to improve storage locality.
-    // Keep slot[] so completion status maps back to the original expert slot.
-    for (int i = 1; i < K; i++) {
-        off_t key_off = plan->offset[i];
-        void *key_dst = plan->dst[i];
-        int key_slot = plan->slot[i];
-        int j = i - 1;
-        while (j >= 0 && plan->offset[j] > key_off) {
-            plan->offset[j + 1] = plan->offset[j];
-            plan->dst[j + 1] = plan->dst[j];
-            plan->slot[j + 1] = plan->slot[j];
-            j--;
-        }
-        plan->offset[j + 1] = key_off;
-        plan->dst[j + 1] = key_dst;
-        plan->slot[j + 1] = key_slot;
     }
     plan->loaded = 0;
     pf->done = 0;
