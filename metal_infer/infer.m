@@ -5383,7 +5383,8 @@ static void fused_layer_forward(
             uint32_t o_out_dim = cfg.hidden_dim;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = cfg.group_size;
-            [enc setComputePipelineState:g_metal->matvec_fast];
+            int use_v3 = (o_in_dim <= 4096 && g_metal->matvec_v3 != nil);
+            [enc setComputePipelineState:use_v3 ? g_metal->matvec_v3 : g_metal->matvec_fast];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
             [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
             [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
@@ -5392,8 +5393,14 @@ static void fused_layer_forward(
             [enc setBytes:&o_out_dim  length:4 atIndex:5];
             [enc setBytes:&o_in_dim   length:4 atIndex:6];
             [enc setBytes:&o_gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            if (use_v3) {
+                uint32_t num_tgs = (o_out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
             [enc endEncoding];
         }
 
