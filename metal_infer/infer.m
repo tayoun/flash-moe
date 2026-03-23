@@ -3303,7 +3303,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 8  // 8 threads for K=8 experts (one per expert)
+#define NUM_IO_THREADS 6  // tuned for K=6: one pread worker per expert read
 
 typedef struct {
     int fd;
