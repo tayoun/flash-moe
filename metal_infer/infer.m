@@ -3343,6 +3343,7 @@ typedef struct {
     pthread_cond_t work_done;
     InferPreadTask *tasks;
     int num_tasks;
+    int active_workers;
     int tasks_completed;
     int generation;          // incremented each dispatch — workers wait for new gen
     volatile int shutdown;
@@ -3363,11 +3364,17 @@ static void *io_pool_worker(void *arg) {
 
         // Snapshot work for this generation
         int num_tasks = g_io_pool.num_tasks;
+        int active_workers = g_io_pool.active_workers;
         InferPreadTask *tasks = g_io_pool.tasks;
         pthread_mutex_unlock(&g_io_pool.mutex);
 
+        if (tid >= active_workers) {
+            pthread_mutex_lock(&g_io_pool.mutex);
+            continue;
+        }
+
         // Process assigned tasks (stride by thread count)
-        for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
+        for (int i = tid; i < num_tasks; i += active_workers) {
             InferPreadTask *t = &tasks[i];
             if (t->lz4_comp_buf && t->lz4_comp_size > 0) {
                 // LZ4 path: read compressed from SSD, decompress into dst
@@ -3387,7 +3394,7 @@ static void *io_pool_worker(void *arg) {
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == NUM_IO_THREADS)
+        if (g_io_pool.tasks_completed == g_io_pool.active_workers)
             pthread_cond_signal(&g_io_pool.work_done);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -3414,10 +3421,12 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     pthread_mutex_lock(&g_io_pool.mutex);
     g_io_pool.tasks = tasks;
     g_io_pool.num_tasks = num_tasks;
+    g_io_pool.active_workers = (num_tasks < NUM_IO_THREADS) ? num_tasks : NUM_IO_THREADS;
+    if (g_io_pool.active_workers < 1) g_io_pool.active_workers = 1;
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+    while (g_io_pool.tasks_completed < g_io_pool.active_workers) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
