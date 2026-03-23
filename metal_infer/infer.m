@@ -6803,12 +6803,11 @@ static void serve_loop(
             fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
                     request_id, pt->count, prefill_ms);
 
+            float *serve_norm_scratch = final_norm_w ? malloc(cfg.hidden_dim * sizeof(float)) : NULL;
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
-                float *normed = malloc(cfg.hidden_dim * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
-                memcpy(hidden, normed, cfg.hidden_dim * sizeof(float));
-                free(normed);
+                cpu_rms_norm(hidden, final_norm_w, serve_norm_scratch, cfg.hidden_dim, cfg.rms_norm_eps);
+                memcpy(hidden, serve_norm_scratch, cfg.hidden_dim * sizeof(float));
             }
             lm_head_forward(wf, hidden, logits);
             int next_token = cpu_argmax(logits, cfg.vocab_size);
@@ -6909,10 +6908,8 @@ static void serve_loop(
                 pos++;
 
                 if (final_norm_w) {
-                    float *normed = malloc(cfg.hidden_dim * sizeof(float));
-                    cpu_rms_norm(hidden, final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
-                    memcpy(hidden, normed, cfg.hidden_dim * sizeof(float));
-                    free(normed);
+                    cpu_rms_norm(hidden, final_norm_w, serve_norm_scratch, cfg.hidden_dim, cfg.rms_norm_eps);
+                    memcpy(hidden, serve_norm_scratch, cfg.hidden_dim * sizeof(float));
                 }
 
                 lm_head_forward(wf, hidden, logits);
@@ -6933,6 +6930,7 @@ static void serve_loop(
             }
 
             // ---- Save session state ----
+            free(serve_norm_scratch);
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
