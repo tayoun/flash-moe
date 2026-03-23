@@ -1234,7 +1234,6 @@ typedef struct {
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
-    id<MTLComputePipelineState> sigmoid_gate_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -1378,7 +1377,6 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
-    ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -5320,11 +5318,11 @@ static void fused_layer_forward(
         //   o_proj reads from buf_attn_out instead of batch_out[6].
         // For CPU attention / linear attn: o_proj reads from batch_out[6] as before.
         //
-        // GPU attn path (12 encoders):
-        //   Enc 1-4: attn_scores + softmax + values + sigmoid -> buf_attn_out
-        //   Enc 5:   o_proj (buf_attn_out -> buf_output)
-        //   Enc 6-7: residual + norm -> buf_input
-        //   Enc 9-12: routing + shared expert
+        // GPU attn path (10 encoders):
+        //   Enc 1-3: attn_scores + softmax + values(sigmoid-gated) -> buf_attn_out
+        //   Enc 4:   o_proj (buf_attn_out -> buf_output)
+        //   Enc 5-6: residual + norm -> buf_input
+        //   Enc 7-10: routing + shared expert
         //
         // CPU attn path (7 encoders):
         //   Enc 1:   o_proj (batch_out[6] -> buf_output)
@@ -5398,21 +5396,9 @@ static void fused_layer_forward(
                 [enc setBytes:&sl        length:4 atIndex:5];
                 [enc setBytes:&seq_stride length:4 atIndex:6];
                 [enc setBytes:&hpkv      length:4 atIndex:7];
+                [enc setBuffer:g_metal->buf_attn_gate     offset:0 atIndex:8];
                 uint32_t total_threads = cfg.head_dim * cfg.num_attn_heads;
                 uint32_t tgs = (total_threads + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-            // Enc A4: sigmoid_gate
-            {
-                uint32_t qdim = cfg.num_attn_heads * cfg.head_dim;
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
-                [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
-                [enc setBytes:&qdim length:4 atIndex:2];
-                uint32_t tgs = (qdim + 255) / 256;
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
