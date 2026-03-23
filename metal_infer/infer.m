@@ -7463,6 +7463,9 @@ int main(int argc, char **argv) {
                 // Disable readahead: expert reads are random (different offsets per token).
                 // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
+                // Experiment: bypass page cache for expert blobs on 16GB systems.
+                // This avoids cache churn when the working set exceeds RAM.
+                fcntl(layer_fds[i], F_NOCACHE, 1);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
