@@ -911,6 +911,46 @@ kernel void residual_add(
     out[tid] = a[tid] + b[tid];
 }
 
+// Fused residual add + RMS sum of squares.
+// Writes out[i] = a[i] + b[i] and accumulates sum(out[i]^2) into sum_sq[0].
+// Designed for one threadgroup (256 threads) over dim=2048 to remove
+// an extra kernel dispatch and buffer read in CMD2.
+kernel void residual_add_sum_sq(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    device float*       sum_sq  [[buffer(3)]],
+    constant uint&      dim     [[buffer(4)]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared[32];
+
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float v = a[i] + b[i];
+        out[i] = v;
+        acc += v * v;
+    }
+
+    float simd_val = simd_sum(acc);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float val = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            sum_sq[0] = val;
+        }
+    }
+}
+
 
 // ============================================================================
 // Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once

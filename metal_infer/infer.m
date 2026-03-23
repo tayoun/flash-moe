@@ -1228,6 +1228,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
+    id<MTLComputePipelineState> residual_add_sum_sq;
     id<MTLComputePipelineState> swiglu;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
@@ -1372,6 +1373,7 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
+    ctx->residual_add_sum_sq = makePipe(@"residual_add_sum_sq");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
@@ -5311,7 +5313,7 @@ static void fused_layer_forward(
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
-        g_metal->residual_add && g_metal->rms_norm_sum &&
+        g_metal->residual_add_sum_sq &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
         // ---- FULLY FUSED CMD2 ----
         // For GPU attention (full-attn layers): attention dispatches are prepended,
@@ -5321,13 +5323,13 @@ static void fused_layer_forward(
         // GPU attn path (12 encoders):
         //   Enc 1-4: attn_scores + softmax + values + sigmoid -> buf_attn_out
         //   Enc 5:   o_proj (buf_attn_out -> buf_output)
-        //   Enc 6-8: residual + norm -> buf_input
+        //   Enc 6-7: residual + norm -> buf_input
         //   Enc 9-12: routing + shared expert
         //
-        // CPU attn path (8 encoders, unchanged):
+        // CPU attn path (7 encoders):
         //   Enc 1:   o_proj (batch_out[6] -> buf_output)
-        //   Enc 2-4: residual + norm -> buf_input
-        //   Enc 5-8: routing + shared expert
+        //   Enc 2-3: residual + norm -> buf_input
+        //   Enc 4-7: routing + shared expert
 
         if (!gpu_attn_fuse && !gpu_linear_attn) {
             // CPU/linear attn: copy attention output to GPU input buffer
@@ -5452,35 +5454,22 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
+        // ---- Enc 2: residual_add_sum_sq (buf_output + buf_residual -> buf_h_mid, buf_sum_sq) ----
         {
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = cfg.hidden_dim;
-            [enc setComputePipelineState:g_metal->residual_add];
+            [enc setComputePipelineState:g_metal->residual_add_sum_sq];
             [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
             [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
             [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // ---- Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq) ----
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-            uint32_t dim = cfg.hidden_dim;
-            [enc setComputePipelineState:g_metal->rms_norm_sum];
-            [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
-            [enc setBytes:&dim length:4 atIndex:2];
+            [enc setBuffer:g_metal->buf_sum_sq   offset:0 atIndex:3];  // sum_sq(out)
+            [enc setBytes:&dim length:4 atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
         }
 
-        // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
+        // ---- Enc 3: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
         {
             NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
                                                (const char *)[g_metal->wf_buf contents]);
