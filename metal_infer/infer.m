@@ -2126,7 +2126,6 @@ static void gpu_encode_experts_batched(
     id<MTLCommandBuffer> cmdbuf,
     int K,                       // number of experts to encode
     const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> expert_input_buf,      // h_post input buffer
     id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
 ) {
     // Select offsets and pipeline based on quantization mode
@@ -2179,7 +2178,7 @@ static void gpu_encode_experts_batched(
             [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
-            [enc setBuffer:expert_input_buf                offset:0           atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
             [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
             [enc setBytes:&gate_up_out length:4 atIndex:5];
             [enc setBytes:&gate_up_in  length:4 atIndex:6];
@@ -5327,7 +5326,6 @@ static void fused_layer_forward(
 
     float *h_post = s_h_post;
     float *h_mid = s_h_mid;
-    id<MTLBuffer> gpu_h_post_buf = nil;  // h_post source buffer for GPU expert kernels
     float *gate_scores = s_gate_scores;
     memset(gate_scores, 0, cfg.num_experts * sizeof(float));
     float *shared_gate = s_shared_gate;
@@ -5559,7 +5557,6 @@ static void fused_layer_forward(
         memcpy(h_mid, [g_metal->buf_h_mid contents], cfg.hidden_dim * sizeof(float));
         // Read h_post from buf_input (needed for expert input)
         memcpy(h_post, [g_metal->buf_input contents], cfg.hidden_dim * sizeof(float));
-        gpu_h_post_buf = g_metal->buf_input;
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, cfg.hidden_dim * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
@@ -5584,7 +5581,6 @@ static void fused_layer_forward(
 
         // Post-attention norm
         cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, cfg.hidden_dim, cfg.rms_norm_eps);
-        gpu_h_post_buf = nil;
 
         // Routing + shared expert batch
         if (have_moe_weights) {
@@ -5848,11 +5844,7 @@ static void fused_layer_forward(
         }
 
         // Shared expert prep (doesn't need expert data — can overlap with async pread)
-        // Reuse buf_input directly when CMD2 fused path already produced h_post on GPU.
-        id<MTLBuffer> expert_input_buf = (gpu_h_post_buf != nil) ? gpu_h_post_buf : g_metal->buf_multi_expert_input;
-        if (expert_input_buf == g_metal->buf_multi_expert_input) {
-            memcpy([g_metal->buf_multi_expert_input contents], h_post, cfg.hidden_dim * sizeof(float));
-        }
+        memcpy([g_metal->buf_multi_expert_input contents], h_post, cfg.hidden_dim * sizeof(float));
         memcpy([g_metal->buf_shared_gate contents], shared_gate,
                cfg.shared_intermediate * sizeof(float));
         memcpy([g_metal->buf_shared_up contents], shared_up,
@@ -5887,7 +5879,7 @@ static void fused_layer_forward(
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_input_buf, expert_bufs);
+        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
