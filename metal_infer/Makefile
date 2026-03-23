@@ -16,7 +16,7 @@
 # MTLDevice newLibraryWithSource:, so no offline metal compiler needed.
 
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
+CFLAGS = -O3 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 LDFLAGS = -lpthread -lcompression
 
@@ -59,9 +59,10 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
-# Build the chat client (thin HTTP/SSE client + linenoise line editor)
-$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
+# Chat client intentionally disabled in this hardened fork.
+$(CHAT_TARGET): $(CHAT_SRC)
+	@echo "chat target disabled: use infer --serve and connect via OpenClaw" >&2
+	@false
 
 clean:
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
