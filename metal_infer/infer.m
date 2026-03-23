@@ -3423,6 +3423,14 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     pthread_mutex_unlock(&g_io_pool.mutex);
 }
 
+// Forward declarations for persistent async prefetch path.
+typedef struct InferPrefetchCtx InferPrefetchCtx;
+static InferPrefetchCtx *g_prefetch = NULL;
+static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+                                 int *expert_indices, int K,
+                                 id<MTLBuffer> __strong *dst_bufs);
+static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K);
+
 // ---- Async expert pread pipeline ----
 // Starts pread on background GCD threads immediately after routing.
 // The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
@@ -3441,6 +3449,10 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
+    if (g_prefetch) {
+        infer_prefetch_start(g_prefetch, packed_fd, expert_indices, K, dst_bufs);
+        return;
+    }
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
@@ -3464,6 +3476,11 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
+    if (g_prefetch) {
+        infer_prefetch_wait(g_prefetch, g_async_pread.valid, g_async_pread.num_tasks);
+        g_async_pread.active = 0;
+        return;
+    }
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
         g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
@@ -3891,14 +3908,14 @@ typedef struct {
     int loaded;             // output: count of successfully loaded experts
 } InferIOPlan;
 
-typedef struct {
+struct InferPrefetchCtx {
     InferIOPlan plan;       // pre-built I/O plan (pure C, no ARC)
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     int start;              // signal: set to 1 to start prefetch
     int done;               // signal: set to 1 when prefetch complete
     int shutdown;           // signal: set to 1 to exit thread
-} InferPrefetchCtx;
+};
 
 static void *infer_prefetch_thread_fn(void *arg) {
     InferPrefetchCtx *pf = (InferPrefetchCtx *)arg;
@@ -3982,7 +3999,6 @@ static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
     return loaded;
 }
 
-static InferPrefetchCtx *g_prefetch = NULL;
 static pthread_t g_prefetch_tid;
 
 static void infer_prefetch_init(void) {
@@ -7145,6 +7161,7 @@ int main(int argc, char **argv) {
 
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
+        infer_prefetch_init();
 
         // ---- Initialize malloc expert cache (if requested) ----
         if (malloc_cache_entries > 0) {
@@ -7644,6 +7661,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Cleanup ----
+        infer_prefetch_shutdown();
         io_pool_shutdown();
         if (g_malloc_cache) {
             malloc_cache_free(g_malloc_cache);
