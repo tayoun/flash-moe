@@ -7008,7 +7008,7 @@ int main(int argc, char **argv) {
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
         int max_tokens = 20;
-        int K = 6;
+        int K = 5;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
