@@ -1709,6 +1709,8 @@ static void gpu_batch_matvec(
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
+    id<MTLComputeCommandEncoder> enc = nil;
+    id<MTLComputePipelineState> current_pipe = nil;
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
@@ -1717,9 +1719,14 @@ static void gpu_batch_matvec(
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
-        [enc setComputePipelineState: use_lut ? ctx->matvec_v5 : ctx->matvec_fast];
+        id<MTLComputePipelineState> pipe = use_lut ? ctx->matvec_v5 : ctx->matvec_fast;
+        if (!enc || current_pipe != pipe) {
+            if (enc) [enc endEncoding];
+            enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            current_pipe = pipe;
+        }
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -1737,8 +1744,8 @@ static void gpu_batch_matvec(
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         }
-        [enc endEncoding];
     }
+    if (enc) [enc endEncoding];
 
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
@@ -1777,6 +1784,8 @@ static void gpu_encode_batch_matvec(
     id<MTLCommandBuffer> cmdbuf,
     BatchMatvecSpec *specs, int num_specs
 ) {
+    id<MTLComputeCommandEncoder> enc = nil;
+    id<MTLComputePipelineState> current_pipe = nil;
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
@@ -1785,9 +1794,14 @@ static void gpu_encode_batch_matvec(
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
-        [enc setComputePipelineState: use_lut ? ctx->matvec_v5 : ctx->matvec_fast];
+        id<MTLComputePipelineState> pipe = use_lut ? ctx->matvec_v5 : ctx->matvec_fast;
+        if (!enc || current_pipe != pipe) {
+            if (enc) [enc endEncoding];
+            enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            current_pipe = pipe;
+        }
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -1805,8 +1819,8 @@ static void gpu_encode_batch_matvec(
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         }
-        [enc endEncoding];
     }
+    if (enc) [enc endEncoding];
 }
 
 // Copy batch results from GPU buffers back to CPU pointers.
