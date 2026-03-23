@@ -1625,7 +1625,7 @@ static void gpu_dequant_matvec(
         o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
     }
 
-    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBufferWithUnretainedReferences];
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
     // Prefer the LUT dequant kernel for <=4096 input dims; fall back to fast kernel for larger inputs.
@@ -1707,7 +1707,7 @@ static void gpu_batch_matvec(
     // Copy input once
     memcpy([ctx->buf_input contents], x_f32, x_dim * sizeof(float));
 
-    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBufferWithUnretainedReferences];
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
@@ -2358,7 +2358,7 @@ static void gpu_expert_forward(
     // 3. SwiGLU (gate_out, up_out -> act_out)
     // 4. down_proj matvec (act_out -> expert_out)
 
-    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBufferWithUnretainedReferences];
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
     // --- Dispatch 1: gate_proj [4096] -> [1024] ---
     {
@@ -4620,7 +4620,7 @@ static void fused_layer_forward(
         // Submit CMD1 immediately — GPU runs CMD3(N-1) then CMD1(N) back-to-back.
         if (g_timing_enabled) { t0 = now_ms(); }
 
-        cmd1 = [g_metal->queue commandBufferWithUnretainedReferences];
+        cmd1 = [g_metal->queue commandBuffer];
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
         // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
@@ -4770,7 +4770,7 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t0 = now_ms(); }
         if (g_metal && g_metal->wf_buf && num_attn_specs > 0) {
             memcpy([g_metal->buf_input contents], normed, cfg.hidden_dim * sizeof(float));
-            cmd1 = [g_metal->queue commandBufferWithUnretainedReferences];
+            cmd1 = [g_metal->queue commandBuffer];
             gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
             // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
@@ -5187,7 +5187,7 @@ static void fused_layer_forward(
                 memcpy([g_metal->buf_delta_g_decay contents], g_decay, cfg.linear_num_v_heads * sizeof(float));
                 memcpy([g_metal->buf_delta_beta contents], beta_gate_arr, cfg.linear_num_v_heads * sizeof(float));
 
-                id<MTLCommandBuffer> cmd_dn = [g_metal->queue commandBufferWithUnretainedReferences];
+                id<MTLCommandBuffer> cmd_dn = [g_metal->queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd_dn computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->delta_net_step];
                 [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
@@ -5342,7 +5342,7 @@ static void fused_layer_forward(
 
         attn_out_for_oproj = NULL;
 
-        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBufferWithUnretainedReferences];
+        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
@@ -5832,7 +5832,7 @@ static void fused_layer_forward(
         // Step 3: encode ALL experts + shared expert into ONE command buffer.
         // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
-        id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBufferWithUnretainedReferences];
+        id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
