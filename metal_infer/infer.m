@@ -1697,6 +1697,10 @@ typedef struct {
     int batch_slot;          // which batch_out[slot] to use for GPU output
 } BatchMatvecSpec;
 
+static inline id<MTLComputePipelineState> select_4bit_expert_matvec_pipe(
+    MetalCtx *ctx, uint32_t out_dim, uint32_t in_dim, uint32_t *rows_per_tg, uint32_t *threads_per_tg
+);
+
 // Run N matmuls in a single command buffer. All share the same input vector.
 // The input is copied once; all outputs go to preallocated batch_out slots.
 static void gpu_batch_matvec(
@@ -1719,8 +1723,15 @@ static void gpu_batch_matvec(
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
-        int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
-        id<MTLComputePipelineState> pipe = use_lut ? ctx->matvec_v5 : ctx->matvec_fast;
+        uint32_t rows_per_tg = 8, threads_per_tg = 256;
+        id<MTLComputePipelineState> pipe = ctx->matvec_fast;
+        int use_v3 = (s->in_dim <= 4096 && ctx->matvec_v3 != nil);
+        if (use_v3) {
+            pipe = select_4bit_expert_matvec_pipe(ctx, s->out_dim, s->in_dim, &rows_per_tg, &threads_per_tg);
+        } else {
+            rows_per_tg = 1;
+            threads_per_tg = 64;
+        }
         if (!enc || current_pipe != pipe) {
             if (enc) [enc endEncoding];
             enc = [cmdbuf computeCommandEncoder];
@@ -1736,13 +1747,13 @@ static void gpu_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_lut) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (use_v3) {
+            uint32_t num_tgs = (s->out_dim + rows_per_tg - 1) / rows_per_tg;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
         }
     }
     if (enc) [enc endEncoding];
@@ -1794,8 +1805,15 @@ static void gpu_encode_batch_matvec(
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
-        int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
-        id<MTLComputePipelineState> pipe = use_lut ? ctx->matvec_v5 : ctx->matvec_fast;
+        uint32_t rows_per_tg = 8, threads_per_tg = 256;
+        id<MTLComputePipelineState> pipe = ctx->matvec_fast;
+        int use_v3 = (s->in_dim <= 4096 && ctx->matvec_v3 != nil);
+        if (use_v3) {
+            pipe = select_4bit_expert_matvec_pipe(ctx, s->out_dim, s->in_dim, &rows_per_tg, &threads_per_tg);
+        } else {
+            rows_per_tg = 1;
+            threads_per_tg = 64;
+        }
         if (!enc || current_pipe != pipe) {
             if (enc) [enc endEncoding];
             enc = [cmdbuf computeCommandEncoder];
@@ -1811,13 +1829,13 @@ static void gpu_encode_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_lut) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (use_v3) {
+            uint32_t num_tgs = (s->out_dim + rows_per_tg - 1) / rows_per_tg;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
         }
     }
     if (enc) [enc endEncoding];
