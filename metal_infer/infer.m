@@ -473,11 +473,23 @@ static inline int expert_is_seen(int layer, int expert) {
 static inline void expert_mark_seen(int layer, int expert) {
     EXPERT_SEEN_BYTE(layer, expert) |= (1 << (expert & 7));
 }
-// Pick fd for expert read. Currently: always use warm fd (OS page cache).
-// Tiered I/O (cold F_NOCACHE for first reads) was tested but OS page cache
-// without any bypass outperforms all custom caching strategies.
+// Pick fd for expert read using tiered I/O:
+//   - first touch of (layer, expert): cold fd (F_NOCACHE)
+//   - subsequent touches: warm fd (OS page cache)
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
-    (void)layer; (void)expert;
+    if (layer < 0 || layer >= cfg.num_layers ||
+        expert < 0 || expert >= cfg.num_experts) {
+        return warm_fd;
+    }
+
+    // First touch uses cold fd (F_NOCACHE) to avoid page-cache pollution.
+    // Re-accesses switch to warm fd to benefit from cache hits.
+    if (g_layer_fds_cold && g_layer_fds_cold[layer] >= 0 &&
+        !expert_is_seen(layer, expert)) {
+        expert_mark_seen(layer, expert);
+        return g_layer_fds_cold[layer];
+    }
+    expert_mark_seen(layer, expert);
     return warm_fd;
 }
 
@@ -3510,6 +3522,7 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
 typedef struct InferPrefetchCtx InferPrefetchCtx;
 static InferPrefetchCtx *g_prefetch = NULL;
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+                                 int layer_idx,
                                  int *expert_indices, int K,
                                  id<MTLBuffer> __strong *dst_bufs);
 static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K);
@@ -3528,19 +3541,20 @@ typedef struct {
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
+                               int layer_idx,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
     (void)mmap_base;
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
     if (g_prefetch) {
-        infer_prefetch_start(g_prefetch, packed_fd, expert_indices, K, dst_bufs);
+        infer_prefetch_start(g_prefetch, packed_fd, layer_idx, expert_indices, K, dst_bufs);
         return;
     }
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
-        g_async_pread.tasks[k].fd = packed_fd;
+        g_async_pread.tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
         g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
         g_async_pread.tasks[k].size = esz;
@@ -4063,9 +4077,9 @@ static void malloc_cache_free(MallocExpertCache *cache) {
 
 typedef struct {
     void *dst[MAX_K];       // raw pointers from [buf contents] (no ARC)
+    int fd[MAX_K];          // fd per expert (warm/cold tiered path)
     off_t offset[MAX_K];    // file offsets per expert
     int K;                  // number of experts
-    int fd;                 // file descriptor for this layer
     int valid[MAX_K];       // output: 1 if pread succeeded
     int loaded;             // output: count of successfully loaded experts
 } InferIOPlan;
@@ -4099,7 +4113,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
         InferIOPlan *plan = &pf->plan;
         InferPreadTask tasks[MAX_K];
         for (int k = 0; k < plan->K; k++) {
-            tasks[k].fd = plan->fd;
+            tasks[k].fd = plan->fd[k];
             tasks[k].dst = plan->dst[k];
             tasks[k].offset = plan->offset[k];
             tasks[k].size = esz;
@@ -4127,15 +4141,16 @@ static void *infer_prefetch_thread_fn(void *arg) {
 // Build I/O plan on main thread (ARC-safe: extracts void* from id<MTLBuffer>),
 // then signal background prefetch thread.
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+                                  int layer_idx,
                                   int *expert_indices, int K,
                                   id<MTLBuffer> __strong *dst_bufs) {
     pthread_mutex_lock(&pf->mutex);
     size_t esz = active_expert_size();
     InferIOPlan *plan = &pf->plan;
-    plan->fd = packed_fd;
     plan->K = K;
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [dst_bufs[k] contents];
+        plan->fd[k] = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         plan->offset[k] = (off_t)expert_indices[k] * esz;
         plan->valid[k] = 0;
     }
@@ -4771,6 +4786,7 @@ static void fused_layer_forward(
             g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
+                              layer_idx,
                               g_metal->buf_multi_expert_data_B, mmap_base);
             pred_started = 1;
         }
@@ -5837,6 +5853,7 @@ static void fused_layer_forward(
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
+                              layer_idx,
                               g_metal->buf_multi_expert_data, mmap_base);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
@@ -7455,7 +7472,7 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
-            layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
+            layer_fds_cold[i] = open(path, O_RDONLY);
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {
@@ -7463,6 +7480,11 @@ int main(int argc, char **argv) {
                 // Disable readahead: expert reads are random (different offsets per token).
                 // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
+                if (layer_fds_cold[i] >= 0) {
+                    // Cold path bypasses page cache for first-touch experts.
+                    fcntl(layer_fds_cold[i], F_NOCACHE, 1);
+                    fcntl(layer_fds_cold[i], F_RDAHEAD, 0);
+                }
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
