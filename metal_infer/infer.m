@@ -55,6 +55,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <math.h>
 #include <getopt.h>
 #include <pthread.h>
@@ -100,6 +101,12 @@ typedef struct {
     // Full attention
     float rope_theta;
     float partial_rotary;
+
+    // M-RoPE (multi-modal RoPE) for Qwen vision-language models
+    // For text-only inference, only mrope_section[0] (temporal) uses token position;
+    // spatial sections use position 0 (identity rotation)
+    int mrope_section[3];    // [temporal_pairs, height_pairs, width_pairs]
+    int mrope_interleaved;   // 1 if interleaved, 0 otherwise
 
     // Layer type map
     int num_full_attn_layers;
@@ -272,9 +279,32 @@ static void load_model_config(const char *model_dir) {
     if (rope) {
         cfg.rope_theta    = [rope[@"rope_theta"] floatValue];
         cfg.partial_rotary = [rope[@"partial_rotary_factor"] floatValue];
+
+        // M-RoPE: parse mrope_section and mrope_interleaved for vision-language models
+        // For text-only inference, only section[0] (temporal) uses token position
+        NSArray *mropeSection = rope[@"mrope_section"];
+        if (mropeSection && [mropeSection count] == 3) {
+            cfg.mrope_section[0] = [mropeSection[0] intValue];  // temporal pairs
+            cfg.mrope_section[1] = [mropeSection[1] intValue];  // height pairs
+            cfg.mrope_section[2] = [mropeSection[2] intValue];  // width pairs
+            cfg.mrope_interleaved = [rope[@"mrope_interleaved"] boolValue] ? 1 : 0;
+            fprintf(stderr, "[config] M-RoPE: sections=[%d,%d,%d], interleaved=%d\n",
+                    cfg.mrope_section[0], cfg.mrope_section[1], cfg.mrope_section[2],
+                    cfg.mrope_interleaved);
+        } else {
+            // No M-RoPE: use all rotary_dim/2 pairs for temporal
+            cfg.mrope_section[0] = 0;  // 0 means "use all pairs for temporal"
+            cfg.mrope_section[1] = 0;
+            cfg.mrope_section[2] = 0;
+            cfg.mrope_interleaved = 0;
+        }
     } else {
         cfg.rope_theta    = 10000000.0f;
         cfg.partial_rotary = 0.25f;
+        cfg.mrope_section[0] = 0;
+        cfg.mrope_section[1] = 0;
+        cfg.mrope_section[2] = 0;
+        cfg.mrope_interleaved = 0;
     }
 
     // Layer types
@@ -1393,6 +1423,86 @@ static int cpu_argmax_excluding(const float *x, int dim, int banned_id) {
         }
     }
     return (best >= 0) ? best : 0;
+}
+
+// Temperature sampling with top-k and top-p (nucleus) filtering
+// This is what Qwen3.5 models expect (generation_config: temp=0.6, top_k=20, top_p=0.95)
+static float g_sampling_temperature = 0.6f;
+static int g_sampling_top_k = 20;
+static float g_sampling_top_p = 0.95f;
+static int g_use_sampling = 0;  // 0 = greedy, 1 = sampling
+
+// Compare function for qsort (descending order)
+static int cmp_idx_val_desc(const void *a, const void *b) {
+    float va = ((const float *)a)[1];
+    float vb = ((const float *)b)[1];
+    return (va < vb) ? 1 : (va > vb) ? -1 : 0;
+}
+
+static int cpu_sample_top_k_p(const float *logits, int vocab_size) {
+    // Create array of (index, logit) pairs
+    static float *idx_val = NULL;
+    static int idx_val_size = 0;
+    if (!idx_val || idx_val_size < vocab_size) {
+        free(idx_val);
+        idx_val = malloc(vocab_size * 2 * sizeof(float));
+        idx_val_size = vocab_size;
+    }
+
+    // Apply temperature and find max for numerical stability
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+
+    for (int i = 0; i < vocab_size; i++) {
+        idx_val[i * 2] = (float)i;  // index
+        idx_val[i * 2 + 1] = (logits[i] - max_logit) / g_sampling_temperature;  // scaled logit
+    }
+
+    // Sort by logit descending
+    qsort(idx_val, vocab_size, 2 * sizeof(float), cmp_idx_val_desc);
+
+    // Apply top-k: keep only top k candidates
+    int k = g_sampling_top_k > 0 ? (g_sampling_top_k < vocab_size ? g_sampling_top_k : vocab_size) : vocab_size;
+
+    // Compute softmax over top-k and apply top-p
+    float sum_exp = 0.0f;
+    for (int i = 0; i < k; i++) {
+        float exp_val = expf(idx_val[i * 2 + 1]);
+        idx_val[i * 2 + 1] = exp_val;
+        sum_exp += exp_val;
+    }
+
+    // Normalize and find top-p cutoff
+    float cumsum = 0.0f;
+    int num_valid = 0;
+    for (int i = 0; i < k; i++) {
+        float prob = idx_val[i * 2 + 1] / sum_exp;
+        idx_val[i * 2 + 1] = prob;
+        cumsum += prob;
+        num_valid = i + 1;
+        if (cumsum >= g_sampling_top_p) break;
+    }
+
+    // Renormalize the valid candidates
+    float valid_sum = 0.0f;
+    for (int i = 0; i < num_valid; i++) {
+        valid_sum += idx_val[i * 2 + 1];
+    }
+
+    // Sample from the distribution
+    float r = (float)rand() / (float)RAND_MAX;
+    float cumprob = 0.0f;
+    for (int i = 0; i < num_valid; i++) {
+        cumprob += idx_val[i * 2 + 1] / valid_sum;
+        if (r < cumprob) {
+            return (int)idx_val[i * 2];  // return the token index
+        }
+    }
+
+    // Fallback: return the most likely token
+    return (int)idx_val[0];
 }
 
 // SiLU activation
@@ -2712,10 +2822,25 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
     // Apply RoPE to the first rotary_dim dimensions of each head
     // NON-TRADITIONAL (MLX default): pairs are (x[i], x[i + half_dim])
     // where half_dim = rotary_dim / 2
+    //
+    // M-RoPE (multi-modal RoPE) for Qwen vision-language models:
+    // If mrope_section[0] > 0, we have M-RoPE with sections [temporal, height, width].
+    // For TEXT-ONLY inference, only the temporal section uses the token position.
+    // Height and width sections use position 0 (identity rotation = no change).
+    // So we only rotate the first mrope_section[0] pairs.
+    //
     int half = rotary_dim / 2;
+
+    // Determine how many pairs to rotate with token position
+    // If mrope_section[0] > 0, only rotate that many pairs (temporal section)
+    // Otherwise, rotate all pairs (standard RoPE)
+    int temporal_pairs = cfg.mrope_section[0];
+    int pairs_to_rotate = (temporal_pairs > 0) ? temporal_pairs : half;
+    if (pairs_to_rotate > half) pairs_to_rotate = half;  // safety clamp
+
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
-        for (int i = 0; i < half; i++) {
+        for (int i = 0; i < pairs_to_rotate; i++) {
             float freq = 1.0f / powf(cfg.rope_theta, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
@@ -2726,10 +2851,12 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             qh[i]        = q0 * cos_a - q1 * sin_a;
             qh[i + half]  = q0 * sin_a + q1 * cos_a;
         }
+        // Pairs from pairs_to_rotate to half-1 use position 0 (identity rotation)
+        // No change needed — values stay as they are
     }
     for (int h = 0; h < num_kv_heads; h++) {
         float *kh = k + h * head_dim;
-        for (int i = 0; i < half; i++) {
+        for (int i = 0; i < pairs_to_rotate; i++) {
             float freq = 1.0f / powf(cfg.rope_theta, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
@@ -2740,6 +2867,8 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             kh[i]        = k0 * cos_a - k1 * sin_a;
             kh[i + half]  = k0 * sin_a + k1 * cos_a;
         }
+        // Pairs from pairs_to_rotate to half-1 use position 0 (identity rotation)
+        // No change needed — values stay as they are
     }
 }
 
@@ -7567,7 +7696,8 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, cfg.vocab_size);
+            int next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
+                                            : cpu_argmax(logits, cfg.vocab_size);
 
             // ---- Auto-regressive generation with SSE streaming ----
             if (g_pred_enabled) {
@@ -7672,7 +7802,8 @@ static void serve_loop(
                 }
 
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, cfg.vocab_size);
+                next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
+                                            : cpu_argmax(logits, cfg.vocab_size);
 
                 // Optional light keepalive every 32 tokens
                 if ((gen_count & 31) == 0) {
@@ -7757,6 +7888,10 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --sample             Enable temperature sampling (default: greedy/argmax)\n");
+    printf("  --temperature F      Sampling temperature (default: 0.6)\n");
+    printf("  --top-k N            Top-k sampling (default: 20, 0=disabled)\n");
+    printf("  --top-p F            Top-p/nucleus sampling (default: 0.95)\n");
     printf("  --help               This message\n");
 }
 
@@ -7811,6 +7946,10 @@ int main(int argc, char **argv) {
             {"private-buf",   no_argument,       0, 267},
             {"nocache",       required_argument, 0, 268},
             {"pin-weights",   no_argument,       0, 269},
+            {"sample",        no_argument,       0, 270},
+            {"temperature",   required_argument, 0, 271},
+            {"top-k",         required_argument, 0, 272},
+            {"top-p",         required_argument, 0, 273},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7897,6 +8036,21 @@ int main(int argc, char **argv) {
                 }
                 case 269:
                     g_pin_weights = 1;
+                    break;
+                case 270:
+                    g_use_sampling = 1;
+                    break;
+                case 271:
+                    g_sampling_temperature = atof(optarg);
+                    g_use_sampling = 1;  // implicitly enable
+                    break;
+                case 272:
+                    g_sampling_top_k = atoi(optarg);
+                    g_use_sampling = 1;
+                    break;
+                case 273:
+                    g_sampling_top_p = atof(optarg);
+                    g_use_sampling = 1;
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -8104,6 +8258,13 @@ int main(int argc, char **argv) {
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Mode:     %s\n", g_serve_mode ? "serve" : "cli");
+        if (g_use_sampling) {
+            printf("Sampling: temp=%.2f, top_k=%d, top_p=%.2f\n",
+                   g_sampling_temperature, g_sampling_top_k, g_sampling_top_p);
+            srand((unsigned int)time(NULL));  // Initialize random seed
+        } else {
+            printf("Sampling: greedy (use --sample for temperature sampling)\n");
+        }
         printf("Matvec:   GPU-first\n");
         printf("\n");
         printf("Tokens:   %d\n", max_tokens);
@@ -8503,7 +8664,8 @@ int main(int argc, char **argv) {
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
-        int next_token = cpu_argmax(logits, cfg.vocab_size);
+        int next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
+                                        : cpu_argmax(logits, cfg.vocab_size);
         double ttft_ms = now_ms() - t0;
 
         // Debug: show top-5 logits for first token
@@ -8584,8 +8746,9 @@ int main(int argc, char **argv) {
             // LM head
             lm_head_forward(wf, hidden, logits);
 
-            // Greedy sample
-            next_token = cpu_argmax(logits, cfg.vocab_size);
+            // Sample next token (greedy or temperature sampling)
+            next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
+                                        : cpu_argmax(logits, cfg.vocab_size);
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
