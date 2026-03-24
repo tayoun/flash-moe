@@ -469,6 +469,9 @@ static int g_think_budget = 2048; // max thinking tokens before force-emitting <
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
 
+// F_NOCACHE mode: 0=off, 1=all expert reads, 2=tiered (cold first, warm repeats)
+static int g_nocache_mode = 0;
+
 // Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
@@ -477,11 +480,23 @@ static inline int expert_is_seen(int layer, int expert) {
 static inline void expert_mark_seen(int layer, int expert) {
     EXPERT_SEEN_BYTE(layer, expert) |= (1 << (expert & 7));
 }
-// Pick fd for expert read. Currently: always use warm fd (OS page cache).
-// Tiered I/O (cold F_NOCACHE for first reads) was tested but OS page cache
-// without any bypass outperforms all custom caching strategies.
+// Pick fd for expert read.
+// g_nocache_mode=0: always warm fd (OS page cache — best for 35B)
+// g_nocache_mode=1: always cold fd (F_NOCACHE — best for 122B where experts >> RAM)
+// g_nocache_mode=2: tiered — cold for first read, warm for repeats
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
-    (void)layer; (void)expert;
+    if (g_nocache_mode == 0) return warm_fd;
+    if (g_nocache_mode == 1) {
+        // All reads through F_NOCACHE fd
+        int cold = g_layer_fds_cold ? g_layer_fds_cold[layer] : -1;
+        return (cold >= 0) ? cold : warm_fd;
+    }
+    // Tiered: first read through cold, repeats through warm
+    if (!expert_is_seen(layer, expert)) {
+        expert_mark_seen(layer, expert);
+        int cold = g_layer_fds_cold ? g_layer_fds_cold[layer] : -1;
+        return (cold >= 0) ? cold : warm_fd;
+    }
     return warm_fd;
 }
 
@@ -608,6 +623,15 @@ static int g_madvise_mode = 0;
 
 // ---- Experiment A: dispatch_io channels instead of pread ----
 static int g_use_dispatch_io = 0;  // --dispatch-io flag
+
+// ---- Experiment: shared weight pinning ----
+static int g_pin_weights = 0;  // --pin-weights: mlock model_weights.bin mmap
+
+// ---- Experiment I: GPU private buffer compression ----
+// Copy expert weights from StorageModeShared to StorageModePrivate before matvec.
+// GPU memory controller applies lossless compression on private buffers,
+// potentially improving effective bandwidth for 4-bit quantized data.
+static int g_use_private_buf = 0;  // --private-buf flag
 
 // ---- Experiment G/H state: declared above (near g_layer_mmaps) for forward reference ----
 // g_car_sample_interval, g_car_residency_cache, g_car_residency_valid, g_car_pop_table
@@ -1458,6 +1482,7 @@ typedef struct {
     #define MAX_K 8
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [cfg.expert_size_4bit bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [cfg.expert_size_4bit bytes] each — buffer set B (prefetch)
+    id<MTLBuffer> buf_multi_expert_priv[MAX_K];  // [cfg.expert_size_4bit bytes] each — StorageModePrivate (Experiment I)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [cfg.moe_intermediate floats]
     id<MTLBuffer> buf_multi_expert_up[MAX_K];     // [cfg.moe_intermediate floats]
     id<MTLBuffer> buf_multi_expert_act[MAX_K];    // [cfg.moe_intermediate floats]
@@ -1665,6 +1690,16 @@ static MetalCtx *metal_setup(void) {
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
+    }
+
+    // Experiment I: StorageModePrivate expert data buffers for GPU compression
+    if (g_use_private_buf) {
+        for (int k = 0; k < MAX_K; k++) {
+            ctx->buf_multi_expert_priv[k] = [ctx->device newBufferWithLength:expert_alloc_size
+                                                                     options:MTLResourceStorageModePrivate];
+        }
+        fprintf(stderr, "[private-buf] allocated %d × %.1f MB StorageModePrivate expert buffers\n",
+                MAX_K, (double)expert_alloc_size / (1024.0 * 1024.0));
     }
 
     // Shared expert buffers (for fused CMD2)
@@ -3753,7 +3788,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     }
 
     for (int k = 0; k < K; k++) {
-        g_async_pread.tasks[k].fd = packed_fd;
+        g_async_pread.tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
         g_async_pread.tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
         g_async_pread.tasks[k].size = esz;
@@ -3934,7 +3969,7 @@ static int parallel_pread_experts(
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
         int phys = expert_physical_pos(layer_idx, expert_indices[k]);
-        tasks[k].fd = packed_fd;
+        tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
         tasks[k].offset = (off_t)phys * esz;
         tasks[k].size = esz;
@@ -3971,7 +4006,7 @@ static int parallel_pread_experts_into(
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
-        tasks[k].fd = packed_fd;
+        tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         tasks[k].dst = [dst_bufs[k] contents];
         tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
         tasks[k].size = esz;
@@ -6234,7 +6269,7 @@ static void fused_layer_forward(
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
-                    tasks[m].fd = packed_fd;
+                    tasks[m].fd = expert_pick_fd(layer_idx, miss_ei[m], packed_fd);
                     tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
                     tasks[m].offset = expert_file_offset(layer_idx, miss_ei[m], esz);
                     tasks[m].size = esz;
@@ -6311,6 +6346,24 @@ static void fused_layer_forward(
         // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
+
+        // Experiment I: blit shared→private buffers for GPU compression
+        if (g_use_private_buf && g_metal->buf_multi_expert_priv[0]) {
+            id<MTLBlitCommandEncoder> blit = [cmd_experts blitCommandEncoder];
+            for (int k = 0; k < actual_K; k++) {
+                if (!valid[k]) continue;
+                [blit copyFromBuffer:expert_bufs[k]
+                        sourceOffset:0
+                            toBuffer:g_metal->buf_multi_expert_priv[k]
+                   destinationOffset:0
+                                size:active_expert_size()];
+            }
+            [blit endEncoding];
+            // Redirect expert_bufs to private buffers for matvec dispatch
+            for (int k = 0; k < actual_K; k++) {
+                if (valid[k]) expert_bufs[k] = g_metal->buf_multi_expert_priv[k];
+            }
+        }
 
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
@@ -7025,6 +7078,23 @@ static char *load_system_prompt(void) {
     return strdup("You are a helpful assistant. /think");
 }
 
+// Tokenize ONLY the system prompt (for KV cache snapshot).
+// Output: <|im_start|>system\n{sys}<|im_end|>\n
+// This does NOT include user turn or assistant tag — those are added per-request.
+static PromptTokens *tokenize_system_only(void) {
+    static char *sys_prompt_text = NULL;
+    if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
+
+    size_t sys_len = strlen(sys_prompt_text);
+    size_t total = 30 + sys_len + 20;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n", sys_prompt_text);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
+}
+
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
@@ -7122,7 +7192,7 @@ static void serve_loop(
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
     fprintf(stderr, "[serve] Pre-caching system prompt...\n");
-    PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
+    PromptTokens *sys_pt = tokenize_system_only();  // system prompt only (no user turn)
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
         // Pre-embed all system prompt tokens
@@ -7737,6 +7807,9 @@ int main(int argc, char **argv) {
             {"dispatch-io",   no_argument,       0, 264},
             {"car-sample",    required_argument, 0, 265},
             {"car-table",     required_argument, 0, 266},
+            {"private-buf",   no_argument,       0, 267},
+            {"nocache",       required_argument, 0, 268},
+            {"pin-weights",   no_argument,       0, 269},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7809,6 +7882,20 @@ int main(int argc, char **argv) {
                 }
                 case 266:
                     g_car_pop_table_path = optarg;
+                    break;
+                case 267:
+                    g_use_private_buf = 1;
+                    break;
+                case 268: {
+                    // --nocache: all, tiered, off
+                    if (strcmp(optarg, "all") == 0) g_nocache_mode = 1;
+                    else if (strcmp(optarg, "tiered") == 0) g_nocache_mode = 2;
+                    else if (strcmp(optarg, "off") == 0) g_nocache_mode = 0;
+                    else fprintf(stderr, "[warn] --nocache: unknown mode '%s' (use all/tiered/off)\n", optarg);
+                    break;
+                }
+                case 269:
+                    g_pin_weights = 1;
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -8041,6 +8128,22 @@ int main(int argc, char **argv) {
             metal_set_weights(g_metal, wf->data, wf->size);
         }
 
+        // Pin shared weights in RAM to prevent eviction by expert I/O
+        if (g_pin_weights && wf->data && wf->size > 0) {
+            // mlock() keeps the mmap'd region in physical RAM.
+            // On 122B, expert reads (2GB/token) pollute page cache and evict
+            // the 3.46GB shared weights. Pinning prevents this.
+            if (mlock(wf->data, wf->size) == 0) {
+                printf("[pin-weights] mlock'd %.2f GB shared weights\n", wf->size / 1e9);
+            } else {
+                // mlock may fail due to RLIMIT_MEMLOCK. Fall back to madvise.
+                fprintf(stderr, "[pin-weights] mlock failed (%s), falling back to MADV_WILLNEED\n",
+                        strerror(errno));
+                madvise(wf->data, wf->size, MADV_WILLNEED);
+                printf("[pin-weights] madvise(MADV_WILLNEED) on %.2f GB shared weights\n", wf->size / 1e9);
+            }
+        }
+
         // ---- Load vocabulary ----
         Vocabulary *vocab = load_vocab(vocab_path);
         if (!vocab) {
@@ -8117,7 +8220,17 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
-            layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
+            if (g_nocache_mode > 0) {
+                // Open a second fd with F_NOCACHE for expert reads that should bypass page cache.
+                // This prevents expert I/O (2GB/token on 122B) from evicting shared weights.
+                layer_fds_cold[i] = open(path, O_RDONLY);
+                if (layer_fds_cold[i] >= 0) {
+                    fcntl(layer_fds_cold[i], F_NOCACHE, 1);
+                    fcntl(layer_fds_cold[i], F_RDAHEAD, 0);
+                }
+            } else {
+                layer_fds_cold[i] = -1;
+            }
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {
@@ -8189,8 +8302,12 @@ int main(int argc, char **argv) {
 
         // Wire up tiered I/O globals
         g_layer_fds_cold = layer_fds_cold;
-        if (!g_use_lz4)
-            printf("[tiered-io] Cold fds (F_NOCACHE) + warm fds (page cached) active\n");
+        if (!g_use_lz4 && g_nocache_mode == 1)
+            printf("[nocache] F_NOCACHE on ALL expert reads (page cache bypass)\n");
+        else if (!g_use_lz4 && g_nocache_mode == 2)
+            printf("[nocache] Tiered: F_NOCACHE for first reads, page cached for repeats\n");
+        else if (!g_use_lz4)
+            printf("[nocache] Off — trusting OS page cache for expert reads\n");
 
         // Warm page cache hint
         if (expert_layers_available > 0) {

@@ -21,3 +21,19 @@ car-sample-8	1.14	19.85	64	CAR threshold=0.35, mincore every 8th token — 11% s
 car-sample-16	1.23	17.86	64	CAR threshold=0.35, mincore every 16th token — 4% slower
 car-pop-table	0.19	111.41	64	CAR threshold=0.35 + popularity table — still catastrophic (mincore dominates)
 car-sample8-table	1.15	20.08	64	CAR threshold=0.35, sample=8 + pop table — no improvement over sample alone
+nocache-off-64	1.23	16.10	64	baseline without F_NOCACHE (clustered experts already)
+nocache-all-64	1.23	16.05	64	F_NOCACHE on ALL expert reads — no improvement
+nocache-all-128	1.20	16.05	128	F_NOCACHE all, 128 tokens — no improvement
+nocache-tiered-128	1.19	16.02	128	F_NOCACHE tiered mode — no improvement
+k8-baseline	1.23	16.10	64	K=8 baseline (default)
+k7	1.34	14.23	64	K=7 — +9% throughput
+k6	1.60	12.71	64	K=6 — +30% throughput
+k5	1.92	10.87	64	K=5 — +56% throughput
+k4-run1	4.04	9.18	64	K=4 — +228% throughput (quality degraded)
+k4-run2	4.06	9.15	64	K=4 — consistent
+k4-run3	4.05	9.11	64	K=4 — consistent
+pin-weights	1.22	16.19	64	mlock shared weights — no improvement
+pin+nocache	1.24	16.18	64	pin-weights + F_NOCACHE — no improvement
+k6-128tok	1.57	12.30	128	K=6 sustained 128 tokens
+k5-compound	1.94	10.72	64	K=5 + pin-weights + nocache — no additional gain
+k6-compound	1.63	12.38	64	K=6 + pin-weights + nocache — no additional gain

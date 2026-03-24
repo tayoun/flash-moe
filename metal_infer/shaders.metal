@@ -81,8 +81,9 @@ kernel void dequant_matvec_4bit(
 
             for (uint n = 0; n < 8; n++) {
                 uint nibble = (packed >> (n * 4)) & 0xF;
-                float w_val = float(nibble) * scale + bias;
-                acc += w_val * x[x_base + n];
+                float sx = scale * x[x_base + n];
+                float bx = bias * x[x_base + n];
+                acc += fma(float(nibble), sx, bx);
             }
         }
     }
@@ -130,14 +131,25 @@ kernel void dequant_matvec_4bit_fast(
             uint32_t packed = w_row[base_packed + p];
             uint x_base = base_x + p * 8;
 
-            acc += (float((packed >>  0) & 0xF) * scale + bias) * x[x_base + 0];
-            acc += (float((packed >>  4) & 0xF) * scale + bias) * x[x_base + 1];
-            acc += (float((packed >>  8) & 0xF) * scale + bias) * x[x_base + 2];
-            acc += (float((packed >> 12) & 0xF) * scale + bias) * x[x_base + 3];
-            acc += (float((packed >> 16) & 0xF) * scale + bias) * x[x_base + 4];
-            acc += (float((packed >> 20) & 0xF) * scale + bias) * x[x_base + 5];
-            acc += (float((packed >> 24) & 0xF) * scale + bias) * x[x_base + 6];
-            acc += (float((packed >> 28) & 0xF) * scale + bias) * x[x_base + 7];
+            // FMA optimization: (nibble * scale + bias) * x = fma(nibble, scale*x, bias*x)
+            // Reduces per-nibble ops from (convert + mul + add + mul + add) to (convert + FMA + add)
+            float sx0 = scale * x[x_base + 0];  float bx0 = bias * x[x_base + 0];
+            float sx1 = scale * x[x_base + 1];  float bx1 = bias * x[x_base + 1];
+            float sx2 = scale * x[x_base + 2];  float bx2 = bias * x[x_base + 2];
+            float sx3 = scale * x[x_base + 3];  float bx3 = bias * x[x_base + 3];
+            float sx4 = scale * x[x_base + 4];  float bx4 = bias * x[x_base + 4];
+            float sx5 = scale * x[x_base + 5];  float bx5 = bias * x[x_base + 5];
+            float sx6 = scale * x[x_base + 6];  float bx6 = bias * x[x_base + 6];
+            float sx7 = scale * x[x_base + 7];  float bx7 = bias * x[x_base + 7];
+
+            acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+            acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+            acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+            acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+            acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+            acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+            acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+            acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
         }
     }
 
