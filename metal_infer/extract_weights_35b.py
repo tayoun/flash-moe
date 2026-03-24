@@ -40,8 +40,7 @@ def parse_safetensors_header(filepath):
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
     parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec'),
+                        default=os.environ.get('MODEL_DIR', ''),
                         help='Path to model directory')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')

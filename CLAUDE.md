@@ -48,7 +48,7 @@ export MODEL_DIR="${MODEL_DIR:-$HOME/.cache/huggingface/hub/models--mlx-communit
 
 python3 build_expert_index_35b.py --model-path "$MODEL_DIR" --out expert_index_35b.json
 python3 repack_experts_35b.py --index expert_index_35b.json
-python3 metal_infer/extract_weights_35b.py --output metal_infer/out_35b
+python3 metal_infer/extract_weights_35b.py --model "$MODEL_DIR" --output metal_infer/out_35b
 python3 metal_infer/export_tokenizer_35b.py "$MODEL_DIR/tokenizer.json" metal_infer/tokenizer.bin
 python3 metal_infer/export_vocab_35b.py "$MODEL_DIR/tokenizer.json" metal_infer/vocab.bin
 

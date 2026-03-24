@@ -77,8 +77,8 @@
 
 #define EXPERT_SIZE      7077888   // Total bytes per expert
 
-// Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+// Default model path (override with --model flag or MODEL_DIR env var)
+#define MODEL_PATH "/path/to/model"
 
 // ============================================================================
 // Timing helper

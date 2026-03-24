@@ -674,7 +674,7 @@ int main(int argc, char **argv) {
         }
         // Note: server-side KV cache may not match if server restarted.
         // The conversation will continue but model won't "remember" old context
-        // unless we re-prefill (TODO: detect server restart and replay).
+        // unless the full history is re-prefilled.
     }
 
     printf("Ready to chat.\n\n");

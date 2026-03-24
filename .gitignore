@@ -44,6 +44,13 @@ program.md
 bench_runner.py
 results.tsv
 metal_infer/results.tsv
+install-service.sh
 
 expert_index_35b.json
 model_manager.py
+
+# Internal decision log (references private fork context)
+docs/DECISIONS.md
+
+# Service / runtime state
+*.pid

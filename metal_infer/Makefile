@@ -7,7 +7,7 @@
 #   make bench    — benchmark single expert (10 iterations)
 #   make moe      — full MoE forward pass (K experts, single layer)
 #   make moebench — benchmark MoE (10 iterations)
-#   make full     — full 60-layer MoE forward pass (K=4)
+#   make full     — full 60-layer MoE forward pass (K=6)
 #   make fullbench — benchmark full 60-layer forward (3 iterations)
 #   make chat     — build interactive chat TUI
 #   make clean    — remove build artifacts
@@ -59,10 +59,8 @@ $(SHADER_LIB): $(SHADER_AIR)
 $(INFER_TARGET): $(INFER_SRC)
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
 
-# Chat client intentionally disabled in this hardened fork.
-$(CHAT_TARGET): $(CHAT_SRC)
-	@echo "chat target disabled: use infer --serve and connect via OpenClaw" >&2
-	@false
+$(CHAT_TARGET): $(CHAT_SRC) linenoise.c
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
 
 clean:
 	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
@@ -87,18 +85,18 @@ moebench: $(TARGET)
 	./$(TARGET) --layer 0 --fast --moe --benchmark
 
 full: $(TARGET)
-	./$(TARGET) --fast --full --k 4
+	./$(TARGET) --fast --full --k 6
 
 fullbench: $(TARGET)
-	./$(TARGET) --fast --full --k 4 --benchmark
+	./$(TARGET) --fast --full --k 6 --benchmark
 
 # Inference engine targets
 build-infer: $(INFER_TARGET)
 
 infer-run: $(INFER_TARGET)
-	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 4
+	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 6
 
 # Chat TUI targets (use: make chat)
 
 chat-run: $(CHAT_TARGET)
-	./$(CHAT_TARGET) --k 4
+	./$(CHAT_TARGET) --k 6
