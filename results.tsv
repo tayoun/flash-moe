@@ -1,4 +1,11 @@
-run	cold_ttft_ms	warm_ttft_ms	sustained_toks	total_time_s	generated_tokens	notes
-1	16188	-	1.12	244.8	256	cold start (first run after build)
-2	-	15474	1.12	242.5	256	warm (page cache partially seeded)
-3	-	15712	1.13	242.3	256	warm (page cache partially seeded)
+experiment	tok_s	ttft_s	tokens	notes
+122b-baseline-cold	1.12	16.19	256	cold start (first run after build)
+122b-baseline-warm1	1.12	15.47	256	warm (page cache partially seeded)
+122b-baseline-warm2	1.13	15.71	256	warm (page cache partially seeded)
+io-threads-1	0.89	23.15	64	1 I/O thread — 20% slower than baseline
+io-threads-2	1.10	18.96	64	2 I/O threads — near baseline
+io-threads-4	1.12	18.41	64	4 I/O threads — matches baseline
+io-threads-8	1.12	18.66	64	8 I/O threads (default) — no gain over 4
+cluster-64tok	1.27	16.78	64	clustered expert layout (11.4x adjacency), +13%
+cluster-128tok	1.28	16.98	128	clustered expert layout, sustained, +14%
+cluster-noperm	1.14	16.49	2	clustered layout WITHOUT permutation — garbage output (expected)

@@ -368,6 +368,9 @@ static void load_model_config(const char *model_dir) {
 // ============================================================================
 
 static int *g_expert_freq = NULL;
+static int *g_expert_cooccur = NULL;  // [num_layers * num_experts * num_experts] pairwise co-occurrence
+static int g_cooccur_tracking = 0;    // enabled by --cooccur <path>
+static char *g_cooccur_output_path = NULL;
 static uint8_t *g_expert_seen = NULL;
 static void **g_lz4_index = NULL;  // actually LZ4IndexEntry**, cast at use site
 static uint8_t *g_cache_seen = NULL;
@@ -381,6 +384,7 @@ static int *g_pred_count = NULL;
 
 // Helper macros for flattened 2D access
 #define FREQ(l, e)           g_expert_freq[(l) * cfg.num_experts + (e)]
+#define COOCCUR(l, e1, e2)   g_expert_cooccur[(l) * cfg.num_experts * cfg.num_experts + (e1) * cfg.num_experts + (e2)]
 #define EXPERT_SEEN_BYTE(l, e) g_expert_seen[(l) * ((cfg.num_experts + 7) / 8) + ((e) >> 3)]
 #define CACHE_SEEN(l, e)     g_cache_seen[(l) * cfg.num_experts + (e)]
 #define CACHE_TOUCH(l, e)    g_cache_last_touch_token[(l) * cfg.num_experts + (e)]
@@ -487,6 +491,22 @@ static inline size_t active_expert_size(void) {
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
+// ---- Expert permutation (for clustered layout) ----
+// g_expert_perm[layer * num_experts + expert_id] = physical_position in layer file
+// When NULL, identity mapping (position = expert_id)
+static int *g_expert_perm = NULL;
+static char *g_permutation_path = NULL;
+
+static inline int expert_physical_pos(int layer, int expert_id) {
+    if (!g_expert_perm) return expert_id;
+    return g_expert_perm[layer * cfg.num_experts + expert_id];
+}
+
+// Compute file offset for an expert, accounting for permutation
+static inline off_t expert_file_offset(int layer, int expert_id, size_t esz) {
+    return (off_t)expert_physical_pos(layer, expert_id) * esz;
+}
+
 // ---- Residency oracle (mincore) ----
 // Set in main() after mmap; used by expert_is_resident() for CAR dry-run.
 static void **g_layer_mmaps = NULL;
@@ -497,7 +517,7 @@ static int expert_is_resident(int layer, int expert_id) {
     if (!g_layer_mmaps || g_layer_mmaps[layer] == MAP_FAILED)
         return 0;
     size_t esz = active_expert_size();
-    size_t offset = (size_t)expert_id * esz;
+    size_t offset = (size_t)expert_physical_pos(layer, expert_id) * esz;
     char *base = (char *)g_layer_mmaps[layer] + offset;
     long page_size = sysconf(_SC_PAGESIZE);
     // Align down to page boundary
@@ -3521,7 +3541,8 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 8  // 8 threads for K=8 experts (one per expert)
+#define MAX_IO_THREADS 16
+static int g_num_io_threads = 8;  // default 8, configurable via --io-threads
 
 // InferPreadTask defined earlier (before safetensor code)
 
@@ -3533,7 +3554,7 @@ typedef struct {
 
 static void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
-    for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
+    for (int i = ta->thread_id; i < ta->num_tasks; i += g_num_io_threads) {
         InferPreadTask *t = &ta->tasks[i];
         t->result = pread(t->fd, t->dst, t->size, t->offset);
     }
@@ -3545,7 +3566,7 @@ static void *infer_pread_thread_fn(void *arg) {
 // ============================================================================
 
 typedef struct {
-    pthread_t threads[NUM_IO_THREADS];
+    pthread_t threads[MAX_IO_THREADS];
     pthread_mutex_t mutex;
     pthread_cond_t work_ready;
     pthread_cond_t work_done;
@@ -3575,7 +3596,7 @@ static void *io_pool_worker(void *arg) {
         pthread_mutex_unlock(&g_io_pool.mutex);
 
         // Process assigned tasks (stride by thread count)
-        for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
+        for (int i = tid; i < num_tasks; i += g_num_io_threads) {
             InferPreadTask *t = &tasks[i];
             if (t->lz4_comp_buf && t->lz4_comp_size > 0) {
                 // LZ4 path: read compressed from SSD, decompress into dst
@@ -3595,7 +3616,7 @@ static void *io_pool_worker(void *arg) {
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == NUM_IO_THREADS)
+        if (g_io_pool.tasks_completed == g_num_io_threads)
             pthread_cond_signal(&g_io_pool.work_done);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -3610,7 +3631,7 @@ static void io_pool_init(void) {
     g_io_pool.shutdown = 0;
     g_io_pool.generation = 0;
     g_io_pool.tasks = NULL;
-    for (int i = 0; i < NUM_IO_THREADS; i++)
+    for (int i = 0; i < g_num_io_threads; i++)
         pthread_create(&g_io_pool.threads[i], NULL, io_pool_worker, (void*)(intptr_t)i);
     g_io_pool_initialized = 1;
 }
@@ -3625,7 +3646,7 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+    while (g_io_pool.tasks_completed < g_num_io_threads) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -3688,7 +3709,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     for (int k = 0; k < K; k++) {
         g_async_pread.tasks[k].fd = packed_fd;
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
+        g_async_pread.tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
         g_async_pread.tasks[k].size = esz;
         g_async_pread.tasks[k].result = 0;
     }
@@ -3807,7 +3828,7 @@ static void io_pool_shutdown(void) {
     g_io_pool.shutdown = 1;
     pthread_cond_broadcast(&g_io_pool.work_ready);
     pthread_mutex_unlock(&g_io_pool.mutex);
-    for (int i = 0; i < NUM_IO_THREADS; i++)
+    for (int i = 0; i < g_num_io_threads; i++)
         pthread_join(g_io_pool.threads[i], NULL);
     pthread_mutex_destroy(&g_io_pool.mutex);
     pthread_cond_destroy(&g_io_pool.work_ready);
@@ -3819,6 +3840,7 @@ static void io_pool_shutdown(void) {
 // Returns number of successfully loaded experts, sets valid[] flags.
 static int parallel_pread_experts(
     int packed_fd,
+    int layer_idx,
     int *expert_indices,
     int K,
     int *valid,  // [MAX_K] output: 1 if expert loaded successfully
@@ -3827,9 +3849,10 @@ static int parallel_pread_experts(
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
+        int phys = expert_physical_pos(layer_idx, expert_indices[k]);
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = (off_t)phys * esz;
         tasks[k].size = esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
@@ -3855,6 +3878,7 @@ static int parallel_pread_experts(
 // ============================================================================
 static int parallel_pread_experts_into(
     int packed_fd,
+    int layer_idx,
     int *expert_indices,
     int K,
     id<MTLBuffer> __strong *dst_bufs,  // target Metal buffers (set A or B)
@@ -3865,7 +3889,7 @@ static int parallel_pread_experts_into(
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
         tasks[k].size = esz;
         tasks[k].result = 0;
     }
@@ -4309,7 +4333,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
     memcpy(plan->expert_indices, expert_indices, K * sizeof(int));
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [dst_bufs[k] contents];
-        plan->offset[k] = (off_t)expert_indices[k] * esz;
+        plan->offset[k] = expert_file_offset(layer_idx, expert_indices[k], esz);
         plan->valid[k] = 0;
     }
     plan->loaded = 0;
@@ -4404,6 +4428,8 @@ static void alloc_tracking_arrays(void) {
     int seen_bytes_per_layer = (ne + 7) / 8;
 
     g_expert_freq            = calloc(nl * ne, sizeof(int));
+    if (g_cooccur_tracking)
+        g_expert_cooccur     = calloc((size_t)nl * ne * ne, sizeof(int));
     g_expert_seen            = calloc(nl * seen_bytes_per_layer, sizeof(uint8_t));
     g_lz4_index              = calloc(nl, sizeof(void *));
     g_cache_seen             = calloc(nl * ne, sizeof(uint8_t));
@@ -5782,6 +5808,15 @@ static void fused_layer_forward(
         }
         if (layer_idx == 0) g_freq_total_tokens++;
     }
+    if (g_cooccur_tracking && g_expert_cooccur) {
+        for (int a = 0; a < K; a++) {
+            for (int b = a + 1; b < K; b++) {
+                int ea = expert_indices[a], eb = expert_indices[b];
+                COOCCUR(layer_idx, ea, eb)++;
+                COOCCUR(layer_idx, eb, ea)++;
+            }
+        }
+    }
 
     // Track speculative routing prediction accuracy
     if (s_spec_count > 0) {
@@ -5961,7 +5996,7 @@ static void fused_layer_forward(
                     int cidx = miss_cache_idx[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = g_malloc_cache->data[cidx];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = NULL;  // always pread for cache population
@@ -6016,7 +6051,7 @@ static void fused_layer_forward(
                     int k = miss_indices[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = [miss_bufs[m] contents];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = mmap_base;
@@ -6077,7 +6112,7 @@ static void fused_layer_forward(
                     int k = miss_k_slots[m];
                     tasks[m].fd = packed_fd;
                     tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
-                    tasks[m].offset = (off_t)miss_ei[m] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, miss_ei[m], esz);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                 }
@@ -6514,6 +6549,39 @@ static void freq_print_analysis(int K) {
     fprintf(stderr, "Expert size: %zu bytes (%.3f MB), %d layers x %d experts = %d total\n",
             active_expert_size(), (double)active_expert_size() / (1024.0 * 1024.0),
             cfg.num_layers, cfg.num_experts, cfg.num_layers * cfg.num_experts);
+}
+
+// ============================================================================
+// Expert co-occurrence dump (--cooccur)
+// ============================================================================
+
+static void cooccur_dump(const char *path) {
+    if (!g_cooccur_tracking || !g_expert_cooccur || !path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "[cooccur] ERROR: cannot open %s\n", path); return; }
+
+    int ne = cfg.num_experts;
+    int nl = cfg.num_layers;
+
+    fprintf(f, "{\n  \"num_layers\": %d,\n  \"num_experts\": %d,\n  \"tokens\": %d,\n  \"layers\": {\n",
+            nl, ne, g_freq_total_tokens);
+
+    for (int l = 0; l < nl; l++) {
+        fprintf(f, "    \"%d\": [\n", l);
+        for (int e1 = 0; e1 < ne; e1++) {
+            fprintf(f, "      [");
+            for (int e2 = 0; e2 < ne; e2++) {
+                fprintf(f, "%d", COOCCUR(l, e1, e2));
+                if (e2 < ne - 1) fprintf(f, ",");
+            }
+            fprintf(f, "]%s\n", e1 < ne - 1 ? "," : "");
+        }
+        fprintf(f, "    ]%s\n", l < nl - 1 ? "," : "");
+    }
+    fprintf(f, "  }\n}\n");
+    fclose(f);
+    fprintf(stderr, "[cooccur] Wrote co-occurrence data to %s (%d layers, %d experts, %d tokens)\n",
+            path, nl, ne, g_freq_total_tokens);
 }
 
 #ifndef CHAT_MODE
@@ -7538,6 +7606,9 @@ int main(int argc, char **argv) {
             {"car-dampen",    no_argument,       0, 257},
             {"car-warmup",    required_argument, 0, 258},
             {"warmup-profile", required_argument, 0, 259},
+            {"io-threads",    required_argument, 0, 260},
+            {"cooccur",       required_argument, 0, 261},
+            {"permutation",   required_argument, 0, 262},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7577,6 +7648,20 @@ int main(int argc, char **argv) {
                 case 257: g_car_dampen = 1; break;
                 case 258: g_car_warmup = atoi(optarg); break;
                 case 259: g_warmup_profile_path = optarg; break;
+                case 260: {
+                    int nt = atoi(optarg);
+                    if (nt >= 1 && nt <= MAX_IO_THREADS) g_num_io_threads = nt;
+                    else fprintf(stderr, "[warn] --io-threads must be 1-%d, using default %d\n", MAX_IO_THREADS, g_num_io_threads);
+                    break;
+                }
+                case 261:
+                    g_cooccur_tracking = 1;
+                    g_freq_tracking = 1;  // co-occurrence needs frequency tracking for token count
+                    g_cooccur_output_path = optarg;
+                    break;
+                case 262:
+                    g_permutation_path = optarg;
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7592,6 +7677,49 @@ int main(int argc, char **argv) {
         if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+
+        // Load expert permutation (for clustered layout)
+        if (g_permutation_path) {
+            FILE *pf = fopen(g_permutation_path, "r");
+            if (!pf) {
+                fprintf(stderr, "ERROR: cannot open permutation file: %s\n", g_permutation_path);
+                return 1;
+            }
+            // Read entire file
+            fseek(pf, 0, SEEK_END);
+            long fsize = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+            char *pjson = malloc(fsize + 1);
+            fread(pjson, 1, fsize, pf);
+            pjson[fsize] = '\0';
+            fclose(pf);
+
+            // Parse inverse map: for each layer, inverse[expert_id] = physical_position
+            g_expert_perm = calloc((size_t)cfg.num_layers * cfg.num_experts, sizeof(int));
+            // Simple JSON parsing: find "inverse" object, then per-layer arrays
+            char *inv = strstr(pjson, "\"inverse\"");
+            if (!inv) {
+                fprintf(stderr, "ERROR: permutation.json missing 'inverse' key\n");
+                free(pjson);
+                return 1;
+            }
+            int loaded_layers = 0;
+            for (int l = 0; l < cfg.num_layers; l++) {
+                char key[32];
+                snprintf(key, sizeof(key), "\"%d\": [", l);
+                char *arr = strstr(inv, key);
+                if (!arr) continue;
+                arr += strlen(key);
+                for (int e = 0; e < cfg.num_experts; e++) {
+                    g_expert_perm[l * cfg.num_experts + e] = (int)strtol(arr, &arr, 10);
+                    while (*arr == ',' || *arr == ' ') arr++;
+                }
+                loaded_layers++;
+            }
+            free(pjson);
+            fprintf(stderr, "[perm] Loaded expert permutation: %d layers from %s\n",
+                    loaded_layers, g_permutation_path);
+        }
 
         // Log CAR configuration
         if (g_car_threshold < 1.0f) {
@@ -8221,6 +8349,7 @@ int main(int argc, char **argv) {
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
+        if (g_cooccur_tracking) cooccur_dump(g_cooccur_output_path);
         if (g_routing_log) {
             fclose(g_routing_log);
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",

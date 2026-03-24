@@ -13,11 +13,23 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL_DIR="${MODEL_DIR:-${MODEL:-}}"
 INFER="${REPO_DIR}/metal_infer/infer"
-WEIGHTS="${WEIGHTS:-${REPO_DIR}/metal_infer/out_35b/model_weights.bin}"
-MANIFEST="${MANIFEST:-${REPO_DIR}/metal_infer/out_35b/model_weights.json}"
-VOCAB="${VOCAB:-${REPO_DIR}/metal_infer/vocab.bin}"
+
+# 122B-aware defaults: detect from MODEL_DIR path
+if [[ "${MODEL_DIR}" == *122B* || "${MODEL_DIR}" == *122b* ]]; then
+    WEIGHTS="${WEIGHTS:-${REPO_DIR}/metal_infer/out_122b/model_weights.bin}"
+    MANIFEST="${MANIFEST:-${REPO_DIR}/metal_infer/out_122b/model_weights.json}"
+    VOCAB="${VOCAB:-${REPO_DIR}/metal_infer/vocab_122b.bin}"
+    K="${K:-8}"
+    STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-120}"
+else
+    WEIGHTS="${WEIGHTS:-${REPO_DIR}/metal_infer/out_35b/model_weights.bin}"
+    MANIFEST="${MANIFEST:-${REPO_DIR}/metal_infer/out_35b/model_weights.json}"
+    VOCAB="${VOCAB:-${REPO_DIR}/metal_infer/vocab.bin}"
+    K="${K:-6}"
+    STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-30}"
+fi
+
 PORT="${PORT:-8100}"
-K="${K:-6}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 SERVER_PID=""
@@ -60,7 +72,7 @@ ${INFER} \
     --serve "${PORT}" >/dev/null 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "${STARTUP_TIMEOUT}"); do
     if curl -s --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
         break
     fi
