@@ -1,8 +1,15 @@
 import json
+import os
 import struct
+import sys
 from pathlib import Path
 
-model_path = Path("/Users/sbaruwal/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec")
+default_model = os.environ.get("MODEL_DIR", "")
+arg_model = sys.argv[1] if len(sys.argv) > 1 else ""
+model_str = arg_model or default_model
+if not model_str:
+    raise SystemExit("Usage: python read_safetensors_headers_35b.py <model_dir> (or set MODEL_DIR)")
+model_path = Path(model_str).expanduser()
 index_path = model_path / "model.safetensors.index.json"
 
 with open(index_path) as f:

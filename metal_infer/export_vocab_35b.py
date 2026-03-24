@@ -8,10 +8,7 @@ from tokenizers import Tokenizer
 
 
 def main():
-    tok_path = sys.argv[1] if len(sys.argv) > 1 else (
-        "/Users/sbaruwal/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/"
-        "snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec/tokenizer.json"
-    )
+    tok_path = sys.argv[1] if len(sys.argv) > 1 else "tokenizer.json"
     out_path = sys.argv[2] if len(sys.argv) > 2 else "vocab.bin"
 
     tok_path = str(Path(tok_path).expanduser())

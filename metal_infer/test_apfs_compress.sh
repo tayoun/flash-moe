@@ -5,7 +5,7 @@
 
 set -e
 
-EXPERTS_DIR="/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3/packed_experts"
+EXPERTS_DIR="${EXPERTS_DIR:-${MODEL_DIR:-}/packed_experts}"
 SRC="$EXPERTS_DIR/layer_00.bin"
 WORKDIR="/tmp/apfs_compress_test"
 
@@ -14,6 +14,7 @@ echo "=== APFS Transparent Compression Test ==="
 # Check source
 if [ ! -f "$SRC" ]; then
     echo "ERROR: source file not found: $SRC"
+    echo "Set MODEL_DIR or EXPERTS_DIR before running this script."
     exit 1
 fi
 

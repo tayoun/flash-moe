@@ -31,11 +31,19 @@ __pycache__/
 *.npz
 logs/
 *.log
+bench.pid
+bench_k4_*.log
 
 # Test binaries and experiment data
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# Internal planning / benchmark artifacts
+program.md
+bench_runner.py
+results.tsv
+metal_infer/results.tsv
 
 expert_index_35b.json
 model_manager.py

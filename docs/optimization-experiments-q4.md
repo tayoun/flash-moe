@@ -1,124 +1,68 @@
-# Q4 Expert Optimization Experiments
-
-## Context
-
-After discovering that 2-bit expert quantization broke tool calling (JSON quotes → backslashes), we reverted to 4-bit experts. This dropped performance from 5.74 tok/s (2-bit) to 3.50 tok/s (4-bit). The goal: recover as much speed as possible while maintaining 4-bit quality.
-
-The 4-bit experts are 7,077,888 bytes each (6.75 MB). With K=4 active experts per layer and 60 layers, each token reads 240 experts = 1.68 GB from SSD.
-
-## Baseline Pipeline (4-bit, K=4, trust OS page cache)
-
-```
-Per layer (4.28 ms avg):
-  cmd1_wait:    1.22 ms  (28%)  GPU: CMD3(prev) + CMD1 attention projections
-  cmd2_wait:    0.55 ms  (13%)  GPU: o_proj + norm + routing + shared expert
-  expert_io:    2.41 ms  (56%)  SSD: 4×7MB parallel pread
-  CPU work:     0.10 ms  ( 2%)  encode + attention + routing + memcpy
-
-60 layers × 4.28 ms = 257 ms per token = 3.90 tok/s
-```
-
-Page cache hit rate: ~71% (35 GB cache, 209 GB model).
-Warm cache parallel pread: 1.0 ms. Cold SSD: 5.8 ms. Mixed: 2.4 ms.
-
-## Experiment Results
-
-### Kept: FMA Dequant Kernel (+2.6% → 4.36 tok/s)
-
-Rearranged the inner loop of `dequant_matvec_4bit_v3` from:
-```metal
-acc += (float(nibble) * scale + bias) * x;
-```
-to:
-```metal
-float sx = scale * x, bx = bias * x;
-acc += fma(float(nibble), sx, bx);
-```
-
-Pre-computing `scale*x` and `bias*x` per input element allows the GPU to use the fused multiply-add unit for the dequant+multiply in one instruction. Reduces per-nibble cost from (convert + mul + add + mul + add) to (convert + fma + add).
-
-Impact: cmd1_wait -5.4%, cmd2_wait -10.7%. Total: 3.90 → 4.36 tok/s.
-
-### Discarded: LZ4 Expert Compression (-13%)
-
-Repacked 209 GB of expert files to 175 GB with LZ4 compression. Apple's LZ4 decompressor runs at 41 GB/s (NEON hardware-accelerated), making decompression only 0.17 ms per expert.
-
-Results:
-- Isolated cold reads: 15-24% faster (less data from SSD)
-- Isolated decompression: 0.17 ms at 41 GB/s (essentially free)
-- **Full pipeline: 3.55 tok/s (-13%)** — the 0.68 ms/layer decompress cost exceeds the warm cache I/O savings. The OS page cache is efficient enough that most reads are warm.
-
-Also tested LZFSE (2.6 GB/s, too slow), APFS transparent compression (kernel serializes read+decompress, 2× slower), and per-expert files (15% slower from VFS metadata overhead).
-
-Key finding: Apple's M3 Max SSD is so fast that CPU-based decompression can't keep up for warm cache reads. LZ4 only wins for cold reads, but the page cache handles most reads.
-
-### Discarded: Expert Routing Prediction (-18%)
-
-Built a temporal prediction system: store previous token's expert routing per layer, prefetch those experts into double-buffered Metal buffers during the next token's CMD1 wait.
-
-Results:
-- Temporal hit rate: 25.6% (only 1 of 4 experts matches between tokens)
-- The 75% misses waste SSD bandwidth and require sync pread after the prediction wait
-- With K=4 parallel reads, wall time = max(4 reads). Need ALL 4 to hit for improvement.
-- P(all 4 hit) at 25% = 0.25⁴ = 0.4%. Practically zero.
-
-Also trained an MLP predictor (31% accuracy from pre-attention hidden state — worse than temporal baseline). The gate_proj "logit lens" approach achieves 53% from pre-attention state, but the K=4 exponential penalty still kills it.
-
-### Discarded: F_RDADVISE Prefetch (net 0%)
-
-Sent F_RDADVISE kernel hints between CMD1 commit and wait to prefetch next token's predicted experts during GPU compute.
-
-Results:
-- expert_io: -31% (page cache warming works!)
-- cmd2_wait: +73% (GPU memory bandwidth contention from SSD DMA)
-- **Net: 0% across 5 diverse prompts**
-
-Root cause: Apple Silicon unified memory architecture. SSD DMA and GPU matvec share the same memory controller. The GPU's dequant kernels are bandwidth-saturated at 418 GiB/s. Even 17.5 GB/s of background DMA (~4%) causes disproportionate latency spikes through memory controller arbitration. This is architectural — cannot be worked around in software.
-
-### Discarded: GPU Kernel Variants
-
-- **LUT dequant (v5)**: Pre-compute 16-entry lookup table per group to eliminate uint→float conversions. -2% because GPU indirect register access serializes.
-- **Vector load (v4)**: uint4 loads for coalesced memory access. -3% from register pressure.
-- **extract_bits intrinsic**: Neutral — compiler already generates the same instruction.
-- **Spin-poll GPU wait**: -23%. CPU spinning steals thermal budget from GPU on unified architecture.
-- **addCompletedHandler**: Neutral in practice — isolated 20% win on micro-benchmark but real workloads have enough GPU compute to hide the wait overhead.
-
-### Discarded: I/O Path Alternatives
-
-- **dispatch_io**: -70%. Apple's GCD I/O framework adds dispatch_data management overhead (allocate, map, memcpy) that far exceeds any kernel scheduling benefit.
-- **aio_read**: -7% (matches GCD group + pread, which we already use).
-- **Expert file clustering**: 0%. NVMe doesn't care about scatter distance at 7MB read granularity. 4 reads spanning 21 MB vs 2.9 GB take the same time.
-- **GPU private buffer compression**: Isolated -13.5% per matvec (GPU hardware memory compression on StorageModePrivate). But in pipeline: blitting 4×7MB shared→private costs more than the matvec savings. -20% overall.
-
-### Analyzed but not implemented: MTP Speculative Decoding
-
-Qwen 3.5 ships with an MTP (Multi-Token Prediction) head — a single MoE transformer layer that predicts the next-next token. The head exists in the model config (`mtp_num_hidden_layers: 1`) but weights were stripped from the MLX quantization.
-
-Analysis showed MTP speculative decoding doesn't help for MoE with SSD streaming: each speculated token requires its OWN expert routing and I/O. Batched verification of 2 tokens costs ~1.75× expert I/O for 1.7 tokens (70% acceptance). Break-even at best.
-
-This contrasts with dense models where verification cost is constant regardless of batch size (same weights for every token).
-
-## The Unified Memory Constraint
-
-The single most important finding: **on Apple Silicon, SSD DMA and GPU compute cannot be profitably overlapped.** They share the same memory controller, and the GPU's dequant kernels are bandwidth-saturated. Any background I/O during GPU compute causes disproportionate GPU slowdown.
-
-This means the serial pipeline (GPU → SSD → GPU) is actually **hardware-optimal** for this architecture. The current pipeline already achieves the best possible scheduling.
+# Q4 Optimization Experiments (M3 Baseline + M4 Port)
 
 ## Summary
 
-| Configuration | tok/s | Status |
-|--------------|-------|--------|
-| 2-bit experts (best speed) | 5.74 | Quality regression (broken JSON) |
-| 2-bit peak single token | 7.05 | Warm cache burst |
-| **4-bit + FMA kernel** | **4.36** | **Current best. Quality preserved.** |
-| 4-bit baseline (no FMA) | 3.90 | Previous 4-bit baseline |
-| 4-bit + LZ4 compression | 3.55 | Decompress overhead > I/O savings |
-| 4-bit + temporal prediction | 3.18 | 25% hit rate wastes SSD bandwidth |
-| 4-bit + F_RDADVISE prefetch | 3.91 | GPU contention cancels I/O savings |
+This document now tracks two phases:
 
-The 4-bit performance ceiling on M3 Max 48GB is approximately **4.4 tok/s** for sustained generation, limited by:
-- 56% SSD expert I/O (2.4 ms/layer, hardware-limited)
-- 41% GPU dequant matvec (1.8 ms/layer, bandwidth-limited)
-- 3% CPU overhead (0.1 ms/layer)
+1. Original M3 Max optimization pass (48GB), culminating at 4.4 tok/s.
+2. M4 16GB port + optimization pass, culminating at 11.5 tok/s and 2.5s TTFT.
 
-Further improvement requires either hardware changes (more RAM for expert caching, faster SSD) or model architecture changes (fewer/smaller experts, larger shared expert to reduce per-token I/O).
+## Results Comparison
+
+| Phase | Hardware | K | Sustained tok/s | TTFT | Outcome |
+|---|---|---:|---:|---:|---|
+| Original baseline | M3 Max 48GB | 4 | 4.4 | ~5.6s | First production-quality release |
+| Current best | M4 16GB | 6 | **11.5** | **2.5s** | 2.6x faster on lower-cost hardware |
+
+## M3 Max Track (Historical)
+
+The original optimization series established:
+
+- Stable 4-bit quality with tool calling.
+- SSD streaming as the practical path for routed experts.
+- Baseline pipeline behavior and first-wave kernel tuning.
+
+Representative kept/discarded experiments from that phase remain relevant for context, including cache strategy and prefetch behavior under Apple unified memory.
+
+## M4 16GB Port: What Changed
+
+The M4 pass focused on end-to-end token latency rather than isolated microbench gains.
+
+### 1. `tg128` Matvec Kernels
+
+- Adopted `tg128` kernel variants in hot matvec paths.
+- Increased effective threadgroup utilization on M4.
+- Reduced matvec-dominant per-layer latency in routed expert compute.
+
+### 2. Encoder Coalescing
+
+- Coalesced encode/prefill work to reduce synchronization and launch overhead.
+- Lowered non-matvec overhead in prompt processing and token-step setup.
+- Major contributor to TTFT reduction.
+
+### 3. Kernel Fusion
+
+- Fused latency-critical adjacent operations in hot paths.
+- Reduced intermediate memory traffic and CPU-GPU round trips.
+- Improved sustained decode throughput in steady state.
+
+### 4. K Became Runtime-Configurable
+
+- K was previously tuned around fixed M3 assumptions.
+- Runtime now supports configurable `--k`; current M4 production profile uses `K=6`.
+- This enables hardware-specific tradeoff tuning without code changes.
+
+## Current M4 Production Profile
+
+- Model: Qwen3.5-35B-A3B-4bit
+- Hardware: Mac mini M4, 16GB unified memory
+- Routing: `K=6`
+- Performance: 11.5 tok/s sustained, 2.5s TTFT
+- Stability: zero crashes in benchmark and tool-calling use
+
+## Lessons
+
+- M-series generation changes can overturn previous kernel assumptions.
+- Launch/sync overhead matters at this scale; coalescing and fusion compound.
+- K must be a runtime knob to preserve portability across Apple Silicon tiers.
+- End-to-end throughput improvements can significantly exceed per-kernel microbench deltas when multiple bottlenecks are addressed together.
