@@ -3,6 +3,7 @@
 #
 # Usage:
 #   MODEL_DIR=/path/to/model ./bench.sh
+#   MODEL_DIR=/path/to/model EXTRA_ARGS="--car-threshold 0.35" ./bench.sh
 #
 # Prints a single RESULT line:
 #   RESULT: tok_s=<...> ttft_s=<...> crashes=<...> quality=<...> tokens=<...>
@@ -18,6 +19,7 @@ VOCAB="${VOCAB:-${REPO_DIR}/metal_infer/vocab.bin}"
 PORT="${PORT:-8100}"
 K="${K:-6}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 SERVER_PID=""
 
 cleanup() {
@@ -48,12 +50,13 @@ for f in "${WEIGHTS}" "${MANIFEST}" "${VOCAB}"; do
     fi
 done
 
-"${INFER}" \
+${INFER} \
     --model "${MODEL_DIR}" \
     --weights "${WEIGHTS}" \
     --manifest "${MANIFEST}" \
     --vocab "${VOCAB}" \
     --k "${K}" \
+    ${EXTRA_ARGS} \
     --serve "${PORT}" >/dev/null 2>&1 &
 SERVER_PID=$!
 
