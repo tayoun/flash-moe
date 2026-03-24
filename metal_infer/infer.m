@@ -2820,8 +2820,10 @@ static void gpu_expert_forward(
 static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
                               int head_dim, int rotary_dim) {
     // Apply RoPE to the first rotary_dim dimensions of each head
-    // NON-TRADITIONAL (MLX default): pairs are (x[i], x[i + half_dim])
-    // where half_dim = rotary_dim / 2
+    //
+    // Two layout modes:
+    //   - Non-interleaved (MLX default): pairs are (x[i], x[i + half_dim])
+    //   - Interleaved (mrope_interleaved=true): pairs are (x[2*i], x[2*i + 1])
     //
     // M-RoPE (multi-modal RoPE) for Qwen vision-language models:
     // If mrope_section[0] > 0, we have M-RoPE with sections [temporal, height, width].
@@ -2830,6 +2832,7 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
     // So we only rotate the first mrope_section[0] pairs.
     //
     int half = rotary_dim / 2;
+    int interleaved = cfg.mrope_interleaved;
 
     // Determine how many pairs to rotate with token position
     // If mrope_section[0] > 0, only rotate that many pairs (temporal section)
@@ -2846,10 +2849,15 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
-            float q0 = qh[i];
-            float q1 = qh[i + half];
-            qh[i]        = q0 * cos_a - q1 * sin_a;
-            qh[i + half]  = q0 * sin_a + q1 * cos_a;
+            // Interleaved: pairs are (x[2*i], x[2*i+1])
+            // Non-interleaved: pairs are (x[i], x[i + half])
+            int idx0 = interleaved ? (2 * i) : i;
+            int idx1 = interleaved ? (2 * i + 1) : (i + half);
+
+            float q0 = qh[idx0];
+            float q1 = qh[idx1];
+            qh[idx0] = q0 * cos_a - q1 * sin_a;
+            qh[idx1] = q0 * sin_a + q1 * cos_a;
         }
         // Pairs from pairs_to_rotate to half-1 use position 0 (identity rotation)
         // No change needed — values stay as they are
@@ -2862,10 +2870,13 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
-            float k0 = kh[i];
-            float k1 = kh[i + half];
-            kh[i]        = k0 * cos_a - k1 * sin_a;
-            kh[i + half]  = k0 * sin_a + k1 * cos_a;
+            int idx0 = interleaved ? (2 * i) : i;
+            int idx1 = interleaved ? (2 * i + 1) : (i + half);
+
+            float k0 = kh[idx0];
+            float k1 = kh[idx1];
+            kh[idx0] = k0 * cos_a - k1 * sin_a;
+            kh[idx1] = k0 * sin_a + k1 * cos_a;
         }
         // Pairs from pairs_to_rotate to half-1 use position 0 (identity rotation)
         // No change needed — values stay as they are
