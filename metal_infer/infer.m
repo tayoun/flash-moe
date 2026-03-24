@@ -544,6 +544,9 @@ static CarBackfillEntry g_car_backfill_queue[CAR_BACKFILL_MAX];
 static int g_car_backfill_count = 0;
 static long g_car_backfill_total = 0;  // total backfills issued
 
+// ---- CAR frequency-based pre-warming (Phase 4.5) ----
+static const char *g_warmup_profile_path = NULL;  // --warmup-profile path
+
 // InferPreadTask: moved here (from I/O section) so safetensor code can use it.
 typedef struct InferPreadTask {
     int fd;
@@ -7487,6 +7490,7 @@ static void print_usage(const char *prog) {
     printf("  --car-threshold F    CAR substitution threshold (1.0=disabled, 0.35=recommended)\n");
     printf("  --car-dampen         Scale substitute expert weight by score ratio (reduces drift)\n");
     printf("  --car-warmup N       First N tokens: no CAR substitutions (warm page cache first)\n");
+    printf("  --warmup-profile F   Pre-warm frequent experts from profile file at startup\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -7533,6 +7537,7 @@ int main(int argc, char **argv) {
             {"car-threshold", required_argument, 0, 256},
             {"car-dampen",    no_argument,       0, 257},
             {"car-warmup",    required_argument, 0, 258},
+            {"warmup-profile", required_argument, 0, 259},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7571,6 +7576,7 @@ int main(int argc, char **argv) {
                 case 256: g_car_threshold = strtof(optarg, NULL); break;
                 case 257: g_car_dampen = 1; break;
                 case 258: g_car_warmup = atoi(optarg); break;
+                case 259: g_warmup_profile_path = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7884,6 +7890,42 @@ int main(int argc, char **argv) {
         float *hidden = calloc(cfg.hidden_dim, sizeof(float));
         float *logits = calloc(cfg.vocab_size, sizeof(float));
         uint16_t *final_norm_w = get_tensor_ptr(wf, "model.norm.weight");
+
+        // ---- Frequency-based pre-warming (Phase 4.5) ----
+        // Read a frequency profile and pread the most common experts to warm page cache.
+        // Profile format: text file, one "layer expert_id count" triple per line.
+        if (g_warmup_profile_path && expert_layers_available > 0) {
+            FILE *fp = fopen(g_warmup_profile_path, "r");
+            if (fp) {
+                double t_warm_start = now_ms();
+                int warmed = 0;
+                size_t esz = active_expert_size();
+                char discard[65536];
+                int layer_id, expert_id, count;
+                while (fscanf(fp, "%d %d %d", &layer_id, &expert_id, &count) == 3) {
+                    if (layer_id < 0 || layer_id >= cfg.num_layers) continue;
+                    if (expert_id < 0 || expert_id >= cfg.num_experts) continue;
+                    if (layer_fds[layer_id] < 0) continue;
+                    // pread to warm page cache (discard data)
+                    off_t off = (off_t)expert_id * esz;
+                    size_t remaining = esz;
+                    while (remaining > 0) {
+                        size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+                        ssize_t nr = pread(layer_fds[layer_id], discard, chunk, off);
+                        if (nr <= 0) break;
+                        remaining -= nr;
+                        off += nr;
+                    }
+                    warmed++;
+                }
+                fclose(fp);
+                fprintf(stderr, "[car] Pre-warmed %d experts from %s in %.0f ms\n",
+                        warmed, g_warmup_profile_path, now_ms() - t_warm_start);
+            } else {
+                fprintf(stderr, "[car] WARNING: cannot open warmup profile: %s\n",
+                        g_warmup_profile_path);
+            }
+        }
 
         // ---- Serve mode: enter HTTP server loop (never returns) ----
         if (serve_port > 0) {
