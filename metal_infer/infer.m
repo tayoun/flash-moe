@@ -514,6 +514,13 @@ static int expert_is_resident(int layer, int expert_id) {
     return 1;
 }
 
+// ---- CAR dry-run state ----
+static int g_car_dry = 0;             // enabled by --car-dry flag
+static int g_car_dry_token = 0;       // current token index
+static long g_car_dry_uncached_total = 0;
+static long g_car_dry_substitutable_total = 0;
+static long g_car_dry_layer_samples = 0;
+
 // InferPreadTask: moved here (from I/O section) so safetensor code can use it.
 typedef struct InferPreadTask {
     int fd;
@@ -5776,6 +5783,37 @@ static void fused_layer_forward(
         g_routing_log_samples++;
     }
 
+    // ---- CAR dry-run: measure residency and substitution potential ----
+    if (g_car_dry && g_layer_mmaps) {
+        int uncached = 0;
+        int substitutable = 0;
+        for (int k = 0; k < K && k < 64; k++) {
+            if (!expert_is_resident(layer_idx, expert_indices[k])) {
+                uncached++;
+                // Find highest-scoring resident alternative not already selected
+                float best_alt_score = -1.0f;
+                for (int e = 0; e < cfg.num_experts; e++) {
+                    // Skip if already in selected set
+                    int already_selected = 0;
+                    for (int j = 0; j < K && j < 64; j++) {
+                        if (expert_indices[j] == e) { already_selected = 1; break; }
+                    }
+                    if (already_selected) continue;
+                    if (!expert_is_resident(layer_idx, e)) continue;
+                    if (gate_scores[e] > best_alt_score) best_alt_score = gate_scores[e];
+                }
+                if (best_alt_score >= 0 && expert_weights[k] > 0) {
+                    float ratio = best_alt_score / gate_scores[expert_indices[k]];
+                    if (ratio >= 0.35f) substitutable++;
+                }
+            }
+        }
+        g_car_dry_uncached_total += uncached;
+        g_car_dry_substitutable_total += substitutable;
+        g_car_dry_layer_samples++;
+        if (layer_idx == 0) g_car_dry_token++;
+    }
+
     // ---- Parallel pread + GPU experts ----
     if (g_timing_enabled) { t0 = now_ms(); }
     float *moe_out = s_moe_out;
@@ -7309,6 +7347,7 @@ static void print_usage(const char *prog) {
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
+    printf("  --car-dry            CAR dry-run: log residency stats without substituting experts\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -7351,6 +7390,7 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"car-dry",       no_argument,       0, 'A'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7385,6 +7425,7 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'A': g_car_dry = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7955,6 +7996,23 @@ int main(int argc, char **argv) {
                    g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
                    g_spec_route_attempts > 0
                        ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
+        }
+
+        if (g_car_dry && g_car_dry_layer_samples > 0) {
+            double avg_uncached = (double)g_car_dry_uncached_total / g_car_dry_layer_samples;
+            double avg_substitutable = (double)g_car_dry_substitutable_total / g_car_dry_layer_samples;
+            double potential_reduction = g_car_dry_uncached_total > 0
+                ? 100.0 * g_car_dry_substitutable_total / g_car_dry_uncached_total : 0.0;
+            printf("\n[car-dry] SUMMARY: tokens=%d layers_sampled=%ld\n",
+                   g_car_dry_token, g_car_dry_layer_samples);
+            printf("[car-dry]   avg_uncached=%.1f/%d avg_substitutable=%.1f @0.35\n",
+                   avg_uncached, K, avg_substitutable);
+            printf("[car-dry]   potential_ssd_reduction=%.1f%%\n", potential_reduction);
+            if (potential_reduction < 20.0) {
+                printf("[car-dry] DECISION: potential_ssd_reduction < 20%% — CAR not worth it at threshold=0.35\n");
+            } else {
+                printf("[car-dry] DECISION: potential_ssd_reduction >= 20%% — CAR viable, proceed to Phase 4\n");
+            }
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
