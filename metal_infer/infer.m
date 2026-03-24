@@ -521,6 +521,29 @@ static long g_car_dry_uncached_total = 0;
 static long g_car_dry_substitutable_total = 0;
 static long g_car_dry_layer_samples = 0;
 
+// ---- CAR substitution state (Phase 4) ----
+static float g_car_threshold = 1.0f;  // 1.0 = disabled, 0.35 = recommended
+static int g_car_dampen = 0;          // scale substitute weight by score ratio
+static int g_car_warmup = 0;          // first N tokens: no substitutions
+static int g_car_token = 0;           // current token counter for warmup
+static long g_car_subs_total = 0;     // total substitutions made
+static long g_car_ssd_avoided = 0;    // SSD reads avoided
+static long g_car_subs_layers = 0;    // layer samples with CAR active
+static double g_car_ratio_sum = 0.0;  // sum of score ratios (for avg)
+static long g_car_ratio_count = 0;    // count of ratios
+
+// ---- CAR backfill state (Phase 4.3) ----
+// Queue of (layer, expert_id) pairs substituted — to be backfilled via async pread
+#define CAR_BACKFILL_MAX 64
+typedef struct {
+    int layer;
+    int expert_id;
+    float score;  // original router score (higher = higher priority)
+} CarBackfillEntry;
+static CarBackfillEntry g_car_backfill_queue[CAR_BACKFILL_MAX];
+static int g_car_backfill_count = 0;
+static long g_car_backfill_total = 0;  // total backfills issued
+
 // InferPreadTask: moved here (from I/O section) so safetensor code can use it.
 typedef struct InferPreadTask {
     int fd;
@@ -5814,6 +5837,74 @@ static void fused_layer_forward(
         if (layer_idx == 0) g_car_dry_token++;
     }
 
+    // ---- CAR substitution (Phase 4): replace uncached experts with resident alternatives ----
+    if (g_car_threshold < 1.0f && g_layer_mmaps) {
+        // Warmup: skip substitution for first N tokens
+        float effective_threshold = g_car_threshold;
+        if (g_car_warmup > 0 && g_car_token < g_car_warmup) {
+            effective_threshold = 1.0f;  // force disabled during warmup
+        }
+        if (layer_idx == 0) g_car_token++;
+
+        if (effective_threshold < 1.0f) {
+            int subs_this_layer = 0;
+            int ssd_avoided = 0;
+            for (int k = 0; k < K && k < 64; k++) {
+                if (expert_is_resident(layer_idx, expert_indices[k]))
+                    continue;  // already cached, no substitution needed
+
+                // Find highest-scoring resident alternative not already selected
+                float best_alt_score = -1.0f;
+                int best_alt_id = -1;
+                for (int e = 0; e < cfg.num_experts; e++) {
+                    int already_selected = 0;
+                    for (int j = 0; j < K && j < 64; j++) {
+                        if (expert_indices[j] == e) { already_selected = 1; break; }
+                    }
+                    if (already_selected) continue;
+                    if (!expert_is_resident(layer_idx, e)) continue;
+                    if (gate_scores[e] > best_alt_score) {
+                        best_alt_score = gate_scores[e];
+                        best_alt_id = e;
+                    }
+                }
+
+                if (best_alt_id < 0 || best_alt_score < 0) continue;
+                float orig_score = gate_scores[expert_indices[k]];
+                if (orig_score <= 0) continue;
+                float ratio = best_alt_score / orig_score;
+
+                if (ratio >= effective_threshold) {
+                    // Queue backfill for the original expert (Phase 4.3)
+                    if (g_car_backfill_count < CAR_BACKFILL_MAX) {
+                        g_car_backfill_queue[g_car_backfill_count].layer = layer_idx;
+                        g_car_backfill_queue[g_car_backfill_count].expert_id = expert_indices[k];
+                        g_car_backfill_queue[g_car_backfill_count].score = orig_score;
+                        g_car_backfill_count++;
+                    }
+
+                    // Substitute
+                    expert_indices[k] = best_alt_id;
+                    if (g_car_dampen) {
+                        // Scale weight by ratio to reduce hidden state drift
+                        expert_weights[k] *= ratio;
+                    }
+                    subs_this_layer++;
+                    ssd_avoided++;
+                    g_car_ratio_sum += ratio;
+                    g_car_ratio_count++;
+                }
+            }
+
+            // Renormalize weights (always — dampening already scaled individual weights)
+            cpu_normalize_weights(expert_weights, K);
+
+            g_car_subs_total += subs_this_layer;
+            g_car_ssd_avoided += ssd_avoided;
+            g_car_subs_layers++;
+        }
+    }
+
     // ---- Parallel pread + GPU experts ----
     if (g_timing_enabled) { t0 = now_ms(); }
     float *moe_out = s_moe_out;
@@ -6180,6 +6271,51 @@ static void fused_layer_forward(
 
         // DEFERRED commit — submit async, don't wait.
         [cmd_experts commit];
+
+        // ---- CAR backfill (Phase 4.3): warm page cache for substituted experts ----
+        // GPU is now busy with expert compute, SSD is idle. Async pread the original
+        // experts that were substituted so mincore() sees them next token.
+        if (g_car_backfill_count > 0 && packed_fd >= 0) {
+            // Sort by score (highest first) — most impactful experts get warmed first
+            for (int i = 1; i < g_car_backfill_count; i++) {
+                CarBackfillEntry key = g_car_backfill_queue[i];
+                int j = i - 1;
+                while (j >= 0 && g_car_backfill_queue[j].score < key.score) {
+                    g_car_backfill_queue[j + 1] = g_car_backfill_queue[j];
+                    j--;
+                }
+                g_car_backfill_queue[j + 1] = key;
+            }
+            // Budget: limit backfill to 4 experts per layer to avoid SSD contention
+            int backfill_budget = g_car_backfill_count < 4 ? g_car_backfill_count : 4;
+            size_t esz = active_expert_size();
+            static dispatch_queue_t backfill_q = NULL;
+            if (!backfill_q) backfill_q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+            for (int i = 0; i < backfill_budget; i++) {
+                int bf_layer = g_car_backfill_queue[i].layer;
+                int bf_expert = g_car_backfill_queue[i].expert_id;
+                int bf_fd = expert_pick_fd(bf_layer, bf_expert, packed_fd);
+                off_t bf_offset = (off_t)bf_expert * esz;
+                // Fire-and-forget async pread to warm page cache (data discarded)
+                dispatch_async(backfill_q, ^{
+                    // Read into a small stack buffer in chunks to avoid large alloc.
+                    // We only need the kernel to page in the data; we discard it.
+                    char discard[65536];
+                    size_t remaining = esz;
+                    off_t off = bf_offset;
+                    while (remaining > 0) {
+                        size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+                        ssize_t nr = pread(bf_fd, discard, chunk, off);
+                        if (nr <= 0) break;
+                        remaining -= nr;
+                        off += nr;
+                    }
+                });
+                g_car_backfill_total++;
+            }
+            g_car_backfill_count = 0;
+        }
+
         if (g_timing_enabled) {
             t1 = now_ms();
             g_timing.cmd3_encode += t1 - t0;
@@ -7348,6 +7484,9 @@ static void print_usage(const char *prog) {
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --car-dry            CAR dry-run: log residency stats without substituting experts\n");
+    printf("  --car-threshold F    CAR substitution threshold (1.0=disabled, 0.35=recommended)\n");
+    printf("  --car-dampen         Scale substitute expert weight by score ratio (reduces drift)\n");
+    printf("  --car-warmup N       First N tokens: no CAR substitutions (warm page cache first)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -7391,6 +7530,9 @@ int main(int argc, char **argv) {
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
             {"car-dry",       no_argument,       0, 'A'},
+            {"car-threshold", required_argument, 0, 256},
+            {"car-dampen",    no_argument,       0, 257},
+            {"car-warmup",    required_argument, 0, 258},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7426,6 +7568,9 @@ int main(int argc, char **argv) {
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'A': g_car_dry = 1; break;
+                case 256: g_car_threshold = strtof(optarg, NULL); break;
+                case 257: g_car_dampen = 1; break;
+                case 258: g_car_warmup = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -7441,6 +7586,12 @@ int main(int argc, char **argv) {
         if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+
+        // Log CAR configuration
+        if (g_car_threshold < 1.0f) {
+            fprintf(stderr, "[car] CAR enabled: threshold=%.2f dampen=%s warmup=%d tokens\n",
+                    g_car_threshold, g_car_dampen ? "yes" : "no", g_car_warmup);
+        }
 
         // Build default paths
         char default_weights[1024], default_manifest[1024], default_vocab[1024], default_prompt_tokens[1024];
@@ -8013,6 +8164,18 @@ int main(int argc, char **argv) {
             } else {
                 printf("[car-dry] DECISION: potential_ssd_reduction >= 20%% — CAR viable, proceed to Phase 4\n");
             }
+        }
+
+        if (g_car_threshold < 1.0f && g_car_subs_layers > 0) {
+            double avg_subs = (double)g_car_subs_total / g_car_subs_layers;
+            double avg_ratio = g_car_ratio_count > 0 ? g_car_ratio_sum / g_car_ratio_count : 0.0;
+            printf("\n[car] SUMMARY: threshold=%.2f dampen=%s warmup=%d\n",
+                   g_car_threshold, g_car_dampen ? "yes" : "no", g_car_warmup);
+            printf("[car]   layers_sampled=%ld substitutions=%ld avg_subs/layer=%.2f\n",
+                   g_car_subs_layers, g_car_subs_total, avg_subs);
+            printf("[car]   ssd_reads_avoided=%ld avg_score_ratio=%.3f\n",
+                   g_car_ssd_avoided, avg_ratio);
+            printf("[car]   backfills_issued=%ld\n", g_car_backfill_total);
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
