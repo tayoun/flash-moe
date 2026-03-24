@@ -7132,8 +7132,8 @@ static PromptTokens *tokenize_chat_message_old(const char *user_content) {
 }
 
 // The main serve loop. Model state must already be initialized.
-// Sync CPU linear attention state → GPU buffers
-static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
+// Sync GPU delta-net state → CPU buffers (for snapshotting after GPU-accelerated prefill)
+static void sync_gpu_to_cpu_delta_state_serve(void **layer_states) {
     if (!g_metal || !g_metal->delta_net_step || !layer_states) return;
     int li = 0;
     for (int i = 0; i < cfg.num_layers; i++) {
@@ -7141,11 +7141,12 @@ static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
         if (!layer_states[i]) { li++; continue; }
         LinearAttnState *la = (LinearAttnState *)layer_states[i];
         if (li < cfg.num_linear_layers) {
+            // Copy FROM GPU TO CPU (GPU state is authoritative after GPU prefill)
             if (g_metal->buf_delta_state[li] && la->ssm_state)
-                memcpy([g_metal->buf_delta_state[li] contents], la->ssm_state,
+                memcpy(la->ssm_state, [g_metal->buf_delta_state[li] contents],
                        cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float));
             if (g_metal->buf_conv_state[li] && la->conv_state)
-                memcpy([g_metal->buf_conv_state[li] contents], la->conv_state,
+                memcpy(la->conv_state, [g_metal->buf_conv_state[li] contents],
                        (cfg.conv_kernel_size - 1) * cfg.linear_conv_dim * sizeof(float));
         }
         li++;
@@ -7231,7 +7232,7 @@ static void serve_loop(
                 memcpy(hidden, sys_embed_batch + (size_t)(sys_pt->count - 1) * cfg.hidden_dim,
                        cfg.hidden_dim * sizeof(float));
             } else {
-                embed_lookup(wf, sys_pt->ids[0], hidden);
+                embed_lookup(wf, sys_pt->ids[sys_pt->count - 1], hidden);
             }
             for (int layer = 0; layer < cfg.num_layers; layer++) {
                 int is_full = cfg.is_full_attn[layer];
@@ -7247,10 +7248,10 @@ static void serve_loop(
         }
         if (sys_embed_batch) { free(sys_embed_batch); sys_embed_batch = NULL; }
         // Sync CPU state → GPU for delta-net
-        sync_cpu_to_gpu_delta_state_serve(layer_states);
+        sync_gpu_to_cpu_delta_state_serve(layer_states);
         fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
     }
-    free(sys_pt);
+    if (sys_pt) { free(sys_pt->ids); free(sys_pt); }
 
     // Save snapshot of KV caches + linear attention state after system prompt
     // These are restored at the start of each request instead of resetting to zero
@@ -7539,7 +7540,7 @@ static void serve_loop(
                     memcpy(hidden, serve_embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
                            cfg.hidden_dim * sizeof(float));
                 } else {
-                    embed_lookup(wf, pt->ids[0], hidden);
+                    embed_lookup(wf, pt->ids[pt->count - 1], hidden);
                 }
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
@@ -8469,7 +8470,7 @@ int main(int argc, char **argv) {
                 memcpy(hidden, embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
                        cfg.hidden_dim * sizeof(float));
             } else {
-                embed_lookup(wf, pt->ids[0], hidden);
+                embed_lookup(wf, pt->ids[pt->count - 1], hidden);
             }
 
             for (int layer = 0; layer < cfg.num_layers; layer++) {
