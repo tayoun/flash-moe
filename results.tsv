@@ -1,0 +1,4 @@
+run	cold_ttft_ms	warm_ttft_ms	sustained_toks	total_time_s	generated_tokens	notes
+1	16188	-	1.12	244.8	256	cold start (first run after build)
+2	-	15474	1.12	242.5	256	warm (page cache partially seeded)
+3	-	15712	1.13	242.3	256	warm (page cache partially seeded)
