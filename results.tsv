@@ -9,3 +9,15 @@ io-threads-8	1.12	18.66	64	8 I/O threads (default) — no gain over 4
 cluster-64tok	1.27	16.78	64	clustered expert layout (11.4x adjacency), +13%
 cluster-128tok	1.28	16.98	128	clustered expert layout, sustained, +14%
 cluster-noperm	1.14	16.49	2	clustered layout WITHOUT permutation — garbage output (expected)
+madvise-sequential	1.28	16.52	64	MADV_SEQUENTIAL on mmap'd layer files — neutral
+madvise-willneed	1.28	16.43	64	MADV_WILLNEED on mmap'd layer files — neutral
+madvise-random	1.29	16.37	64	MADV_RANDOM on mmap'd layer files — neutral (noise)
+dispatch-io-run1	1.30	16.28	64	dispatch_io channels vs pread — marginal +2%
+dispatch-io-run2	1.31	16.20	64	dispatch_io run 2 — consistent 1.30-1.31
+dispatch-io-run3	1.30	16.15	64	dispatch_io run 3 — within noise of baseline
+car-full-mincore	0.18	115.28	64	CAR threshold=0.35, full mincore every token — catastrophic
+car-sample-4	1.01	21.75	64	CAR threshold=0.35, mincore every 4th token — 21% slower
+car-sample-8	1.14	19.85	64	CAR threshold=0.35, mincore every 8th token — 11% slower
+car-sample-16	1.23	17.86	64	CAR threshold=0.35, mincore every 16th token — 4% slower
+car-pop-table	0.19	111.41	64	CAR threshold=0.35 + popularity table — still catastrophic (mincore dominates)
+car-sample8-table	1.15	20.08	64	CAR threshold=0.35, sample=8 + pop table — no improvement over sample alone

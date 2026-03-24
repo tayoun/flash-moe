@@ -534,6 +534,41 @@ static int expert_is_resident(int layer, int expert_id) {
     return 1;
 }
 
+// Experiment G: Lightweight CAR — sample every N tokens
+static int g_car_sample_interval = 1;  // 1 = every token (default), 4 or 8 = sampled
+static uint8_t *g_car_residency_cache = NULL;
+static int g_car_residency_valid = 0;
+
+// Experiment H: Popularity-table CAR
+static int *g_car_pop_table = NULL;  // [num_layers * num_experts] = best_substitute_id
+
+// ---- Experiment G: sampled residency check ----
+// Refresh the full residency cache (called every g_car_sample_interval tokens).
+static void car_refresh_residency_cache(void) {
+    if (!g_car_residency_cache || !g_layer_mmaps) return;
+    for (int l = 0; l < cfg.num_layers; l++) {
+        for (int e = 0; e < cfg.num_experts; e++) {
+            int idx = l * cfg.num_experts + e;
+            g_car_residency_cache[idx] = (uint8_t)expert_is_resident(l, e);
+        }
+    }
+    g_car_residency_valid = 1;
+}
+
+// Sampled variant: uses cached residency if available, else falls through to mincore.
+static int expert_is_resident_sampled(int layer, int expert_id) {
+    if (g_car_sample_interval <= 1 || !g_car_residency_cache || !g_car_residency_valid)
+        return expert_is_resident(layer, expert_id);
+    return g_car_residency_cache[layer * cfg.num_experts + expert_id];
+}
+
+// ---- Experiment H: popularity-table CAR lookup ----
+// Returns the precomputed best substitute for (layer, expert_id), or -1.
+static int car_pop_table_lookup(int layer, int expert_id) {
+    if (!g_car_pop_table) return -1;
+    return g_car_pop_table[layer * cfg.num_experts + expert_id];
+}
+
 // ---- CAR dry-run state ----
 static int g_car_dry = 0;             // enabled by --car-dry flag
 static int g_car_dry_token = 0;       // current token index
@@ -566,6 +601,17 @@ static long g_car_backfill_total = 0;  // total backfills issued
 
 // ---- CAR frequency-based pre-warming (Phase 4.5) ----
 static const char *g_warmup_profile_path = NULL;  // --warmup-profile path
+
+// ---- Experiment C: madvise hint for mmap'd layer files ----
+// 0=none (default), 1=MADV_SEQUENTIAL, 2=MADV_WILLNEED, 3=MADV_RANDOM
+static int g_madvise_mode = 0;
+
+// ---- Experiment A: dispatch_io channels instead of pread ----
+static int g_use_dispatch_io = 0;  // --dispatch-io flag
+
+// ---- Experiment G/H state: declared above (near g_layer_mmaps) for forward reference ----
+// g_car_sample_interval, g_car_residency_cache, g_car_residency_valid, g_car_pop_table
+static const char *g_car_pop_table_path = NULL;  // --car-table path
 
 // InferPreadTask: moved here (from I/O section) so safetensor code can use it.
 typedef struct InferPreadTask {
@@ -3714,6 +3760,44 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         g_async_pread.tasks[k].result = 0;
     }
 
+    // ---- Experiment A: dispatch_io channel path ----
+    if (g_use_dispatch_io) {
+        if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+        static dispatch_queue_t dio_q = NULL;
+        if (!dio_q) dio_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+        for (int k = 0; k < K; k++) {
+            InferPreadTask *t = &g_async_pread.tasks[k];
+            dispatch_io_t channel = dispatch_io_create(DISPATCH_IO_RANDOM, packed_fd, dio_q, ^(int error) {
+                if (error) fprintf(stderr, "[dispatch_io] cleanup error: %d\n", error);
+            });
+            // Set high water mark to expert size for single large read
+            dispatch_io_set_high_water(channel, t->size);
+            dispatch_group_enter(g_async_pread.group);
+            __block size_t bytes_read = 0;
+            dispatch_io_read(channel, t->offset, t->size, dio_q,
+                ^(bool done, dispatch_data_t data, int error) {
+                    if (data) {
+                        // Copy dispatch_data into our destination buffer
+                        // dispatch_data_apply iterates over contiguous regions
+                        dispatch_data_apply(data, ^bool(dispatch_data_t region __unused,
+                                                         size_t offset __unused,
+                                                         const void *buf, size_t len) {
+                            memcpy((char *)t->dst + bytes_read, buf, len);
+                            bytes_read += len;
+                            return true;
+                        });
+                    }
+                    if (done) {
+                        t->result = error ? -1 : (ssize_t)bytes_read;
+                        dispatch_group_leave(g_async_pread.group);
+                    }
+                });
+            dispatch_io_close(channel, 0);
+        }
+        return;
+    }
+
     // Fire off async reads on GCD and return immediately.
     // Coalesce adjacent expert offsets into one preadv() when possible.
     // This reduces syscall overhead and can improve NVMe sequential read behavior.
@@ -5882,14 +5966,54 @@ static void fused_layer_forward(
         if (g_car_warmup > 0 && g_car_token < g_car_warmup) {
             effective_threshold = 1.0f;  // force disabled during warmup
         }
-        if (layer_idx == 0) g_car_token++;
+        if (layer_idx == 0) {
+            g_car_token++;
+            // Experiment G: refresh residency cache every N tokens
+            if (g_car_sample_interval > 1 && g_car_residency_cache &&
+                (g_car_token % g_car_sample_interval) == 1) {
+                car_refresh_residency_cache();
+            }
+        }
 
         if (effective_threshold < 1.0f) {
             int subs_this_layer = 0;
             int ssd_avoided = 0;
             for (int k = 0; k < K && k < 64; k++) {
-                if (expert_is_resident(layer_idx, expert_indices[k]))
+                if (expert_is_resident_sampled(layer_idx, expert_indices[k]))
                     continue;  // already cached, no substitution needed
+
+                // Experiment H: popularity-table fast path
+                if (g_car_pop_table) {
+                    int sub_id = car_pop_table_lookup(layer_idx, expert_indices[k]);
+                    if (sub_id >= 0 && expert_is_resident_sampled(layer_idx, sub_id)) {
+                        // Verify not already selected
+                        int already = 0;
+                        for (int j = 0; j < K && j < 64; j++) {
+                            if (expert_indices[j] == sub_id) { already = 1; break; }
+                        }
+                        if (!already) {
+                            float orig_score = gate_scores[expert_indices[k]];
+                            float alt_score = gate_scores[sub_id];
+                            float ratio = (orig_score > 0) ? alt_score / orig_score : 0;
+                            if (ratio >= effective_threshold) {
+                                if (g_car_backfill_count < CAR_BACKFILL_MAX) {
+                                    g_car_backfill_queue[g_car_backfill_count].layer = layer_idx;
+                                    g_car_backfill_queue[g_car_backfill_count].expert_id = expert_indices[k];
+                                    g_car_backfill_queue[g_car_backfill_count].score = orig_score;
+                                    g_car_backfill_count++;
+                                }
+                                expert_indices[k] = sub_id;
+                                if (g_car_dampen) expert_weights[k] *= ratio;
+                                subs_this_layer++;
+                                ssd_avoided++;
+                                g_car_ratio_sum += ratio;
+                                g_car_ratio_count++;
+                                continue;  // skip the full scan below
+                            }
+                        }
+                    }
+                    // Table miss or not resident — fall through to full scan
+                }
 
                 // Find highest-scoring resident alternative not already selected
                 float best_alt_score = -1.0f;
@@ -5900,7 +6024,7 @@ static void fused_layer_forward(
                         if (expert_indices[j] == e) { already_selected = 1; break; }
                     }
                     if (already_selected) continue;
-                    if (!expert_is_resident(layer_idx, e)) continue;
+                    if (!expert_is_resident_sampled(layer_idx, e)) continue;
                     if (gate_scores[e] > best_alt_score) {
                         best_alt_score = gate_scores[e];
                         best_alt_id = e;
@@ -7609,6 +7733,10 @@ int main(int argc, char **argv) {
             {"io-threads",    required_argument, 0, 260},
             {"cooccur",       required_argument, 0, 261},
             {"permutation",   required_argument, 0, 262},
+            {"madvise",       required_argument, 0, 263},
+            {"dispatch-io",   no_argument,       0, 264},
+            {"car-sample",    required_argument, 0, 265},
+            {"car-table",     required_argument, 0, 266},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -7661,6 +7789,26 @@ int main(int argc, char **argv) {
                     break;
                 case 262:
                     g_permutation_path = optarg;
+                    break;
+                case 263: {
+                    // --madvise: sequential, willneed, random
+                    if (strcmp(optarg, "sequential") == 0) g_madvise_mode = 1;
+                    else if (strcmp(optarg, "willneed") == 0) g_madvise_mode = 2;
+                    else if (strcmp(optarg, "random") == 0) g_madvise_mode = 3;
+                    else fprintf(stderr, "[warn] --madvise: unknown mode '%s' (use sequential/willneed/random)\n", optarg);
+                    break;
+                }
+                case 264:
+                    g_use_dispatch_io = 1;
+                    break;
+                case 265: {
+                    int si = atoi(optarg);
+                    if (si >= 1 && si <= 32) g_car_sample_interval = si;
+                    else fprintf(stderr, "[warn] --car-sample must be 1-32\n");
+                    break;
+                }
+                case 266:
+                    g_car_pop_table_path = optarg;
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -7719,6 +7867,59 @@ int main(int argc, char **argv) {
             free(pjson);
             fprintf(stderr, "[perm] Loaded expert permutation: %d layers from %s\n",
                     loaded_layers, g_permutation_path);
+        }
+
+        // Experiment G: allocate residency cache if sampling enabled
+        if (g_car_sample_interval > 1) {
+            g_car_residency_cache = calloc((size_t)cfg.num_layers * cfg.num_experts, 1);
+            fprintf(stderr, "[car-sample] Residency sampling enabled: interval=%d tokens\n",
+                    g_car_sample_interval);
+        }
+
+        // Experiment H: load popularity table if provided
+        if (g_car_pop_table_path) {
+            FILE *ptf = fopen(g_car_pop_table_path, "r");
+            if (ptf) {
+                g_car_pop_table = calloc((size_t)cfg.num_layers * cfg.num_experts, sizeof(int));
+                // Initialize to -1 (no substitute)
+                for (int i = 0; i < cfg.num_layers * cfg.num_experts; i++)
+                    g_car_pop_table[i] = -1;
+                // Parse JSON: {"layer_0": {"expert_0": substitute_id, ...}, ...}
+                fseek(ptf, 0, SEEK_END);
+                long ptsz = ftell(ptf);
+                fseek(ptf, 0, SEEK_SET);
+                char *ptjson = malloc(ptsz + 1);
+                fread(ptjson, 1, ptsz, ptf);
+                ptjson[ptsz] = '\0';
+                fclose(ptf);
+                // Simple parser: look for "layer_N" then pairs of expert_id: substitute_id
+                for (int l = 0; l < cfg.num_layers; l++) {
+                    char key[32];
+                    snprintf(key, sizeof(key), "\"layer_%d\"", l);
+                    char *lp = strstr(ptjson, key);
+                    if (!lp) continue;
+                    lp = strchr(lp, '{');
+                    if (!lp) continue;
+                    lp++;
+                    // Parse "N": M pairs until }
+                    while (*lp && *lp != '}') {
+                        while (*lp && (*lp < '0' || *lp > '9') && *lp != '}') lp++;
+                        if (*lp == '}') break;
+                        int eid = (int)strtol(lp, &lp, 10);
+                        while (*lp && *lp != ':') lp++;
+                        if (*lp == ':') lp++;
+                        while (*lp && (*lp == ' ' || *lp == '\t')) lp++;
+                        int sid = (int)strtol(lp, &lp, 10);
+                        if (eid >= 0 && eid < cfg.num_experts && sid >= 0 && sid < cfg.num_experts) {
+                            g_car_pop_table[l * cfg.num_experts + eid] = sid;
+                        }
+                    }
+                }
+                free(ptjson);
+                fprintf(stderr, "[car-table] Loaded popularity table from %s\n", g_car_pop_table_path);
+            } else {
+                fprintf(stderr, "[warn] Cannot open --car-table: %s\n", g_car_pop_table_path);
+            }
         }
 
         // Log CAR configuration
@@ -7929,11 +8130,16 @@ int main(int argc, char **argv) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
-                        // No madvise: kernel default is best.
-                        // MADV_RANDOM disables readahead (tested: hurts).
-                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
-                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
-                        // of hints — this is inherent to the page cache's physical page layout.
+                        // Apply madvise hint if experiment flag is set
+                        if (g_madvise_mode == 1)
+                            madvise(layer_mmaps[i], st.st_size, MADV_SEQUENTIAL);
+                        else if (g_madvise_mode == 2)
+                            madvise(layer_mmaps[i], st.st_size, MADV_WILLNEED);
+                        else if (g_madvise_mode == 3)
+                            madvise(layer_mmaps[i], st.st_size, MADV_RANDOM);
+                        // Default (0): no madvise — kernel default is best for 35B.
+                        // Testing for 122B where expert size (5.06MB) and total (61GB)
+                        // may change page cache dynamics.
                     }
                 }
             }
