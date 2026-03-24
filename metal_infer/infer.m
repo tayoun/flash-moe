@@ -487,6 +487,33 @@ static inline size_t active_expert_size(void) {
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
+// ---- Residency oracle (mincore) ----
+// Set in main() after mmap; used by expert_is_resident() for CAR dry-run.
+static void **g_layer_mmaps = NULL;
+
+// Check if expert's pages are resident in the OS page cache via mincore().
+// Returns 1 if all pages are resident, 0 otherwise.
+static int expert_is_resident(int layer, int expert_id) {
+    if (!g_layer_mmaps || g_layer_mmaps[layer] == MAP_FAILED)
+        return 0;
+    size_t esz = active_expert_size();
+    size_t offset = (size_t)expert_id * esz;
+    char *base = (char *)g_layer_mmaps[layer] + offset;
+    long page_size = sysconf(_SC_PAGESIZE);
+    // Align down to page boundary
+    uintptr_t aligned_start = (uintptr_t)base & ~(page_size - 1);
+    uintptr_t end = (uintptr_t)base + esz;
+    size_t len = end - aligned_start;
+    size_t num_pages = (len + page_size - 1) / page_size;
+    char vec[num_pages];
+    if (mincore((void *)aligned_start, len, vec) != 0)
+        return 0;
+    for (size_t i = 0; i < num_pages; i++) {
+        if (!(vec[i] & 1)) return 0;
+    }
+    return 1;
+}
+
 // InferPreadTask: moved here (from I/O section) so safetensor code can use it.
 typedef struct InferPreadTask {
     int fd;
@@ -7586,6 +7613,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, cfg.num_layers);
+        g_layer_mmaps = layer_mmaps;  // expose for expert_is_resident()
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
