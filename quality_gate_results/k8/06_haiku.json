@@ -1,0 +1,24 @@
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+: keep-alive
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Write"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" a"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" ha"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"iku"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" about"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" machine"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" learning"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
