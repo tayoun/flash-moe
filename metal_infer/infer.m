@@ -6,7 +6,7 @@
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Supported: Qwen3.5-35B-A3B, Qwen3.5-397B-A17B, and compatible MoE variants.
+ * Supported: Qwen3.5-35B-A3B, Qwen3.5-122B-A10B, Qwen3.5-397B-A17B, and compatible MoE variants.
  * Architecture auto-detected from config.json:
  *   - N layers: mix of linear attention (GatedDeltaNet) + full attention
  *   - Configurable hidden_size, head_dim, num_attention_heads, num_kv_heads
@@ -486,6 +486,81 @@ static inline size_t active_expert_size(void) {
     return g_use_2bit ? cfg.expert_size_2bit : cfg.expert_size_4bit;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+
+// InferPreadTask: moved here (from I/O section) so safetensor code can use it.
+typedef struct InferPreadTask {
+    int fd;
+    void *dst;
+    off_t offset;
+    size_t size;
+    ssize_t result;
+    const void *mmap_base;
+    void *lz4_comp_buf;
+    uint32_t lz4_comp_size;
+} InferPreadTask;
+
+// ============================================================================
+// Safetensor direct-read mode: read expert components from .safetensors files
+// instead of repacked packed_experts/ layer files.  Needed for 122B on 16GB
+// (no disk space to repack 60.8 GB of expert layer files).
+// ============================================================================
+
+#define NUM_EXPERT_COMPONENTS 9
+
+typedef struct {
+    int fd;              // safetensor shard file descriptor
+    off_t base_offset;   // byte offset of expert 0's component in the shard
+    size_t stride;       // bytes between consecutive experts
+    size_t size;         // per-expert component size in bytes
+    size_t dst_offset;   // offset within contiguous expert buffer
+} SafetensorComponentInfo;
+
+typedef struct {
+    SafetensorComponentInfo comp[NUM_EXPERT_COMPONENTS];
+} SafetensorLayerMap;
+
+static SafetensorLayerMap *g_safetensor_map = NULL;  // [num_layers] — set during init
+static int g_use_safetensors = 0;                     // 1 = read from safetensors directly
+
+// Build N pread tasks (up to 9*K) for reading expert components from safetensors.
+// dst_ptrs[k] points to the start of expert k's contiguous buffer.
+// Returns the total number of tasks written.
+static int build_safetensor_tasks(InferPreadTask *tasks, int layer_idx,
+                                  int *expert_indices, int K, void **dst_ptrs) {
+    SafetensorLayerMap *lm = &g_safetensor_map[layer_idx];
+    int n = 0;
+    for (int k = 0; k < K; k++) {
+        for (int c = 0; c < NUM_EXPERT_COMPONENTS; c++) {
+            SafetensorComponentInfo *ci = &lm->comp[c];
+            tasks[n].fd = ci->fd;
+            tasks[n].dst = (char *)dst_ptrs[k] + ci->dst_offset;
+            tasks[n].offset = ci->base_offset + (off_t)expert_indices[k] * ci->stride;
+            tasks[n].size = ci->size;
+            tasks[n].result = 0;
+            tasks[n].mmap_base = NULL;
+            tasks[n].lz4_comp_buf = NULL;
+            tasks[n].lz4_comp_size = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+// Check all tasks from build_safetensor_tasks completed successfully.
+// tasks has 9*K entries; valid[k] is set per-expert (all 9 components must succeed).
+static int check_safetensor_tasks(InferPreadTask *tasks, int K, int *valid) {
+    int loaded = 0;
+    for (int k = 0; k < K; k++) {
+        int ok = 1;
+        for (int c = 0; c < NUM_EXPERT_COMPONENTS; c++) {
+            InferPreadTask *t = &tasks[k * NUM_EXPERT_COMPONENTS + c];
+            if (t->result != (ssize_t)t->size) { ok = 0; break; }
+        }
+        valid[k] = ok;
+        if (ok) loaded++;
+    }
+    return loaded;
+}
 
 typedef struct {
     uint64_t token_clock;
@@ -3388,17 +3463,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 
 #define NUM_IO_THREADS 8  // 8 threads for K=8 experts (one per expert)
 
-typedef struct {
-    int fd;
-    void *dst;
-    off_t offset;
-    size_t size;
-    ssize_t result;
-    const void *mmap_base;  // if non-NULL, memcpy from mmap instead of pread
-    // LZ4 compression fields (set by caller when reading compressed experts)
-    void *lz4_comp_buf;     // if non-NULL: pread into this, then LZ4 decompress into dst
-    uint32_t lz4_comp_size; // compressed size to read from disk
-} InferPreadTask;
+// InferPreadTask defined earlier (before safetensor code)
 
 typedef struct {
     InferPreadTask *tasks;
@@ -3511,7 +3576,8 @@ typedef struct InferPrefetchCtx InferPrefetchCtx;
 static InferPrefetchCtx *g_prefetch = NULL;
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                  int *expert_indices, int K,
-                                 id<MTLBuffer> __strong *dst_bufs);
+                                 id<MTLBuffer> __strong *dst_bufs,
+                                 int layer_idx);
 static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K);
 
 // ---- Async expert pread pipeline ----
@@ -3519,8 +3585,9 @@ static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K);
 // The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
 // Wait for completion right before CMD3 needs the expert data.
 typedef struct {
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K * NUM_EXPERT_COMPONENTS];  // enlarged for safetensors (9 per expert)
     int num_tasks;
+    int num_experts;  // K (for validation)
     int valid[MAX_K];
     dispatch_group_t group;
     int active;
@@ -3528,16 +3595,35 @@ typedef struct {
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
-                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
+                               int layer_idx) {
     (void)mmap_base;
     size_t esz = active_expert_size();
-    g_async_pread.num_tasks = K;
+    g_async_pread.num_experts = K;
     g_async_pread.active = 1;
     if (g_prefetch) {
-        infer_prefetch_start(g_prefetch, packed_fd, expert_indices, K, dst_bufs);
+        infer_prefetch_start(g_prefetch, packed_fd, expert_indices, K, dst_bufs, layer_idx);
         return;
     }
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+
+    if (g_use_safetensors) {
+        void *dst_ptrs[MAX_K];
+        for (int k = 0; k < K; k++) dst_ptrs[k] = [dst_bufs[k] contents];
+        g_async_pread.num_tasks = build_safetensor_tasks(g_async_pread.tasks, layer_idx,
+                                                          expert_indices, K, dst_ptrs);
+        // Fire all tasks via GCD (no coalescing for safetensors — reads are scattered)
+        static dispatch_queue_t io_q2 = NULL;
+        if (!io_q2) io_q2 = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+        int total = g_async_pread.num_tasks;
+        for (int i = 0; i < total; i++) {
+            InferPreadTask *t = &g_async_pread.tasks[i];
+            dispatch_group_async(g_async_pread.group, io_q2, ^{
+                t->result = pread(t->fd, t->dst, t->size, t->offset);
+            });
+        }
+        return;
+    }
 
     for (int k = 0; k < K; k++) {
         g_async_pread.tasks[k].fd = packed_fd;
@@ -3639,13 +3725,18 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     if (g_prefetch) {
-        infer_prefetch_wait(g_prefetch, g_async_pread.valid, g_async_pread.num_tasks);
+        infer_prefetch_wait(g_prefetch, g_async_pread.valid, g_async_pread.num_experts);
         g_async_pread.active = 0;
         return;
     }
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
-    for (int k = 0; k < g_async_pread.num_tasks; k++) {
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+    if (g_use_safetensors) {
+        check_safetensor_tasks(g_async_pread.tasks, g_async_pread.num_experts,
+                               g_async_pread.valid);
+    } else {
+        for (int k = 0; k < g_async_pread.num_experts; k++) {
+            g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+        }
     }
     g_async_pread.active = 0;
 }
@@ -4064,8 +4155,10 @@ static void malloc_cache_free(MallocExpertCache *cache) {
 typedef struct {
     void *dst[MAX_K];       // raw pointers from [buf contents] (no ARC)
     off_t offset[MAX_K];    // file offsets per expert
+    int expert_indices[MAX_K]; // expert indices (for safetensors component lookup)
     int K;                  // number of experts
     int fd;                 // file descriptor for this layer
+    int layer_idx;          // layer index (for safetensors)
     int valid[MAX_K];       // output: 1 if pread succeeded
     int loaded;             // output: count of successfully loaded experts
 } InferIOPlan;
@@ -4094,9 +4187,26 @@ static void *infer_prefetch_thread_fn(void *arg) {
         pf->start = 0;
         pthread_mutex_unlock(&pf->mutex);
 
+        InferIOPlan *plan = &pf->plan;
+
+        if (g_use_safetensors) {
+            // Safetensors path: 9 component reads per expert
+            InferPreadTask st_tasks[MAX_K * NUM_EXPERT_COMPONENTS];
+            int ntasks = build_safetensor_tasks(st_tasks, plan->layer_idx,
+                                                plan->expert_indices, plan->K,
+                                                plan->dst);
+            io_pool_dispatch(st_tasks, ntasks);
+            plan->loaded = check_safetensor_tasks(st_tasks, plan->K, plan->valid);
+
+            pthread_mutex_lock(&pf->mutex);
+            pf->done = 1;
+            pthread_cond_signal(&pf->cond);
+            pthread_mutex_unlock(&pf->mutex);
+            continue;
+        }
+
         // Execute parallel pread (pure C, no ARC objects)
         size_t esz = active_expert_size();
-        InferIOPlan *plan = &pf->plan;
         InferPreadTask tasks[MAX_K];
         for (int k = 0; k < plan->K; k++) {
             tasks[k].fd = plan->fd;
@@ -4128,12 +4238,15 @@ static void *infer_prefetch_thread_fn(void *arg) {
 // then signal background prefetch thread.
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                   int *expert_indices, int K,
-                                  id<MTLBuffer> __strong *dst_bufs) {
+                                  id<MTLBuffer> __strong *dst_bufs,
+                                  int layer_idx) {
     pthread_mutex_lock(&pf->mutex);
     size_t esz = active_expert_size();
     InferIOPlan *plan = &pf->plan;
     plan->fd = packed_fd;
     plan->K = K;
+    plan->layer_idx = layer_idx;
+    memcpy(plan->expert_indices, expert_indices, K * sizeof(int));
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [dst_bufs[k] contents];
         plan->offset[k] = (off_t)expert_indices[k] * esz;
@@ -4771,7 +4884,8 @@ static void fused_layer_forward(
             g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
-                              g_metal->buf_multi_expert_data_B, mmap_base);
+                              g_metal->buf_multi_expert_data_B, mmap_base,
+                              layer_idx);
             pred_started = 1;
         }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
@@ -5837,7 +5951,8 @@ static void fused_layer_forward(
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base);
+                              g_metal->buf_multi_expert_data, mmap_base,
+                              layer_idx);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
@@ -6759,29 +6874,34 @@ static void serve_loop(
 
         // GET /health
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            const char *resp =
+            char health_resp[512];
+            snprintf(health_resp, sizeof(health_resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-35b-a3b\"}\n";
-            http_write_str(client_fd, resp);
+                "{\"status\":\"ok\",\"model\":\"flash-moe\","
+                "\"hidden\":%d,\"layers\":%d,\"experts\":%d,\"K\":%d}\n",
+                cfg.hidden_dim, cfg.num_layers, cfg.num_experts, K);
+            http_write_str(client_fd, health_resp);
             free(reqbuf); close(client_fd);
             continue;
         }
 
         // GET /v1/models
         if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-            const char *resp =
+            char models_resp[512];
+            snprintf(models_resp, sizeof(models_resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-35b-a3b\","
-                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
-            http_write_str(client_fd, resp);
+                "{\"object\":\"list\",\"data\":[{\"id\":\"flash-moe-%dB\","
+                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n",
+                cfg.num_layers > 40 ? 122 : 35);
+            http_write_str(client_fd, models_resp);
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -7146,13 +7266,13 @@ static void serve_loop(
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --model PATH         Model path\n");
-    printf("  --weights PATH       model_weights.bin path (default: metal_infer/out_35b/model_weights.bin)\n");
-    printf("  --manifest PATH      model_weights.json path (default: metal_infer/out_35b/model_weights.json)\n");
+    printf("  --weights PATH       model_weights.bin path (auto-detected from model dir)\n");
+    printf("  --manifest PATH      model_weights.json path (auto-detected from model dir)\n");
     printf("  --vocab PATH         vocab.bin path (default: metal_infer/vocab.bin or vocab.bin)\n");
     printf("  --prompt-tokens PATH tokenizer.bin / prompt_tokens.bin path (default: metal_infer/tokenizer.bin or tokenizer.bin)\n");
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
-    printf("  --k N                Active experts per layer (default: 4)\n");
+    printf("  --k N                Active experts per layer (default: from config num_experts_per_tok)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
@@ -7177,7 +7297,7 @@ int main(int argc, char **argv) {
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
         int max_tokens = 20;
-        int K = 6;
+        int K = -1;  // -1 = use config's num_experts_per_tok
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
@@ -7249,57 +7369,45 @@ int main(int argc, char **argv) {
 
         // ---- Load model configuration from HF config.json ----
         load_model_config(model_path ? model_path : "");
-        // Model config checks for Qwen3.5-35B-A3B
-        if (cfg.num_layers != 40) {
-            fprintf(stderr, "ERROR: Expected 40 layers for Qwen3.5-35B-A3B, got %d\n", cfg.num_layers);
-            return 1;
-        }
-        if (cfg.num_experts != 256) {
-            fprintf(stderr, "ERROR: Expected 256 experts for Qwen3.5-35B-A3B, got %d\n", cfg.num_experts);
-            return 1;
-        }
-        if (cfg.hidden_dim != 2048) {
-            fprintf(stderr, "ERROR: Expected hidden_dim 2048 for Qwen3.5-35B-A3B, got %d\n", cfg.hidden_dim);
-            return 1;
-        }
-        if (cfg.moe_intermediate != 512) {
-            fprintf(stderr, "ERROR: Expected moe_intermediate 512 for Qwen3.5-35B-A3B, got %d\n", cfg.moe_intermediate);
-            return 1;
-        }
-        if (cfg.shared_intermediate != 512) {
-            fprintf(stderr, "ERROR: Expected shared_intermediate 512 for Qwen3.5-35B-A3B, got %d\n", cfg.shared_intermediate);
-            return 1;
-        }
+        // Use config's num_experts_per_tok if K was not explicitly set
+        if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
 
         // Build default paths
         char default_weights[1024], default_manifest[1024], default_vocab[1024], default_prompt_tokens[1024];
 
-        // Try to find files relative to the executable
+        // Try to find weight files: check model-specific dirs, then generic locations
+        // Search order: out_122b, out_35b, metal_infer/out_*, current dir
         if (!weights_path) {
-            snprintf(default_weights, sizeof(default_weights),
-                     "out_35b/model_weights.bin");
-            if (access(default_weights, R_OK) != 0) {
+            const char *search_dirs[] = {
+                "out_122b", "out_35b",
+                "metal_infer/out_122b", "metal_infer/out_35b",
+                NULL
+            };
+            for (int si = 0; search_dirs[si]; si++) {
                 snprintf(default_weights, sizeof(default_weights),
-                         "metal_infer/out_35b/model_weights.bin");
-                if (access(default_weights, R_OK) != 0) {
-                    snprintf(default_weights, sizeof(default_weights),
-                             "model_weights.bin");
-                }
+                         "%s/model_weights.bin", search_dirs[si]);
+                if (access(default_weights, R_OK) == 0) break;
+            }
+            if (access(default_weights, R_OK) != 0) {
+                snprintf(default_weights, sizeof(default_weights), "model_weights.bin");
             }
             weights_path = default_weights;
         }
         if (!manifest_path) {
-            snprintf(default_manifest, sizeof(default_manifest),
-                     "out_35b/model_weights.json");
-            if (access(default_manifest, R_OK) != 0) {
+            const char *search_dirs[] = {
+                "out_122b", "out_35b",
+                "metal_infer/out_122b", "metal_infer/out_35b",
+                NULL
+            };
+            for (int si = 0; search_dirs[si]; si++) {
                 snprintf(default_manifest, sizeof(default_manifest),
-                         "metal_infer/out_35b/model_weights.json");
-                if (access(default_manifest, R_OK) != 0) {
-                    snprintf(default_manifest, sizeof(default_manifest),
-                             "model_weights.json");
-                }
+                         "%s/model_weights.json", search_dirs[si]);
+                if (access(default_manifest, R_OK) == 0) break;
+            }
+            if (access(default_manifest, R_OK) != 0) {
+                snprintf(default_manifest, sizeof(default_manifest), "model_weights.json");
             }
             manifest_path = default_manifest;
         }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-extract_weights_35b.py — Extract all non-expert weights from Qwen3.5-35B-A3B-4bit
-into a single binary file that the C inference engine can mmap.
+extract_weights_35b.py — Extract all non-expert weights from Qwen3.5 MoE models
+(35B-A3B, 122B-A10B, etc.) into a single binary file that the C inference engine can mmap.
 
 Outputs:
   - model_weights.bin: binary blob containing all non-expert weight tensors
@@ -114,48 +114,45 @@ def main():
         all_tensors.append((san_name, name, tensors_to_extract[name]))
 
     # Write binary file
+    # Read model config from config.json instead of hardcoding
+    config_path = model_path / 'config.json'
+    if not config_path.exists():
+        print(f"ERROR: {config_path} not found", file=sys.stderr)
+        sys.exit(1)
+    with open(config_path) as f:
+        model_config = json.load(f)
+    tc = model_config["text_config"]
+    rp = tc.get("rope_parameters", {})
+
     bin_path = output_dir / 'model_weights.bin'
     manifest = {
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
+        # Model config for the C engine — derived from config.json
         "config": {
-            "hidden_size": 2048,
-            "num_hidden_layers": 40,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "rms_norm_eps": 1e-6,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 32,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
+            "hidden_size": tc["hidden_size"],
+            "num_hidden_layers": tc["num_hidden_layers"],
+            "num_attention_heads": tc["num_attention_heads"],
+            "num_key_value_heads": tc["num_key_value_heads"],
+            "head_dim": tc["head_dim"],
+            "vocab_size": tc["vocab_size"],
+            "rms_norm_eps": tc.get("rms_norm_eps", 1e-6),
+            "num_experts": tc["num_experts"],
+            "num_experts_per_tok": tc["num_experts_per_tok"],
+            "moe_intermediate_size": tc["moe_intermediate_size"],
+            "shared_expert_intermediate_size": tc["shared_expert_intermediate_size"],
+            "full_attention_interval": tc.get("full_attention_interval", 4),
+            "linear_num_value_heads": tc.get("linear_num_value_heads", 32),
+            "linear_num_key_heads": tc.get("linear_num_key_heads", 16),
+            "linear_key_head_dim": tc.get("linear_key_head_dim", 128),
+            "linear_value_head_dim": tc.get("linear_value_head_dim", 128),
+            "linear_conv_kernel_dim": tc.get("linear_conv_kernel_dim", 4),
+            "partial_rotary_factor": rp.get("partial_rotary_factor", tc.get("partial_rotary_factor", 0.25)),
+            "rope_theta": rp.get("rope_theta", tc.get("rope_theta", 10000000.0)),
+            "layer_types": tc["layer_types"],
         }
     }
-
-    # Layer type map
-    layer_types = []
-    for i in range(manifest["config"]["num_hidden_layers"]):
-        if (i + 1) % 4 == 0:
-            layer_types.append("full_attention")
-        else:
-            layer_types.append("linear_attention")
-    manifest["config"]["layer_types"] = layer_types
-
-    if manifest["config"]["num_hidden_layers"] != 40:
-        raise ValueError(f"Unexpected num_hidden_layers: {manifest['config']['num_hidden_layers']}")
-    if manifest["config"]["num_experts"] != 256:
-        raise ValueError(f"Unexpected num_experts: {manifest['config']['num_experts']}")
 
     print(f"\nWriting {bin_path}...")
     t0 = time.time()
