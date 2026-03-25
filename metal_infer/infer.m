@@ -7168,8 +7168,7 @@ static const char *CORS_RESPONSE =
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
-    // For reasoning models, we MUST append <think>\n to trigger generation
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -7187,7 +7186,7 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
