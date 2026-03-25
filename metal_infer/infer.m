@@ -284,12 +284,13 @@ static void load_model_config(const char *model_dir) {
         // For text-only inference, only section[0] (temporal) uses token position
         NSArray *mropeSection = rope[@"mrope_section"];
         if (mropeSection && [mropeSection count] == 3) {
-            cfg.mrope_section[0] = [mropeSection[0] intValue];  // temporal pairs
-            cfg.mrope_section[1] = [mropeSection[1] intValue];  // height pairs
-            cfg.mrope_section[2] = [mropeSection[2] intValue];  // width pairs
+            // For text-only inference, all 3 sections use the same token position.
+            // So we treat it as standard RoPE (all pairs) instead of just the temporal section.
+            cfg.mrope_section[0] = 0;  // 0 means "use all pairs"
+            cfg.mrope_section[1] = 0;
+            cfg.mrope_section[2] = 0;
             cfg.mrope_interleaved = [rope[@"mrope_interleaved"] boolValue] ? 1 : 0;
-            fprintf(stderr, "[config] M-RoPE: sections=[%d,%d,%d], interleaved=%d\n",
-                    cfg.mrope_section[0], cfg.mrope_section[1], cfg.mrope_section[2],
+            fprintf(stderr, "[config] M-RoPE detected, using full standard RoPE with interleaved=%d\n",
                     cfg.mrope_interleaved);
         } else {
             // No M-RoPE: use all rotary_dim/2 pairs for temporal
@@ -1414,7 +1415,7 @@ static int cpu_argmax(const float *x, int dim) {
 // Argmax while excluding one token id (cheap anti-loop fallback).
 static int cpu_argmax_excluding(const float *x, int dim, int banned_id) {
     int best = -1;
-    float best_val = -INFINITY;
+    float best_val = -1e30f;
     for (int i = 0; i < dim; i++) {
         if (i == banned_id) continue;
         if (best < 0 || x[i] > best_val) {
@@ -7167,7 +7168,8 @@ static const char *CORS_RESPONSE =
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    // For reasoning models, we MUST append <think>\n to trigger generation
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
@@ -7185,7 +7187,7 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     // EOS/<|im_end|> is already in the state (fed through model at end of generation)
     // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
