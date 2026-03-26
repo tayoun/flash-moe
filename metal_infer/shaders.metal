@@ -1689,3 +1689,57 @@ kernel void turbo3_quantize_kv_batch(
         if (bit_pos > 5) dst.qs[byte_idx + 1] |= (idx >> (8 - bit_pos));
     }
 }
+
+
+// ============================================================================
+// Kernel: TurboQuant batch KV dequantization (for attention read path)
+// ============================================================================
+// Decompresses multiple KV vectors in parallel for GPU attention.
+// Dispatch: seq_len * n_kv_heads threads.
+// Each thread decompresses one 256-element head.
+
+kernel void turbo3_dequantize_kv_batch(
+    device const block_turbo3_256* kv_compressed [[buffer(0)]],  // [seq_len, n_kv_heads] compressed input
+    device float*                  kv_fp32       [[buffer(1)]],  // [seq_len, n_kv_heads, head_dim] output
+    constant uint&                 seq_len       [[buffer(2)]],
+    constant uint&                 n_kv_heads    [[buffer(3)]],
+    constant uint&                 head_dim      [[buffer(4)]],  // must be 256
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total_heads = seq_len * n_kv_heads;
+    if (gid >= total_heads) return;
+
+    // Map gid to (pos_idx, head_idx)
+    uint pos_idx = gid / n_kv_heads;
+    uint head_idx = gid % n_kv_heads;
+
+    device const block_turbo3_256& src = kv_compressed[gid];
+    device float* dst = kv_fp32 + (pos_idx * n_kv_heads + head_idx) * head_dim;
+
+    float norm = float(src.norm);
+
+    // Step 1: Unpack 3-bit indices and look up centroids
+    float x[256];
+    for (int i = 0; i < 256; i++) {
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+
+        // Read up to 2 bytes to extract 3 bits
+        uint16_t raw = uint16_t(src.qs[byte_idx]);
+        if (byte_idx + 1 < 96) {
+            raw |= uint16_t(src.qs[byte_idx + 1]) << 8;
+        }
+        uint8_t idx = (raw >> bit_pos) & 0x7;
+
+        x[i] = TURBO3_CENTROIDS[idx];
+    }
+
+    // Step 2: Apply inverse WHT rotation
+    turbo_rotate_inverse_256(x);
+
+    // Step 3: Rescale by original norm and write output
+    for (int i = 0; i < 256; i++) {
+        dst[i] = x[i] * norm;
+    }
+}

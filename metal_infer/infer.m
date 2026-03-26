@@ -1649,11 +1649,13 @@ typedef struct {
     id<MTLBuffer> buf_conv_input;     // [cfg.linear_conv_dim=8192] float
     id<MTLBuffer> buf_conv_output;    // [cfg.linear_conv_dim=8192] float
     // TurboQuant KV cache compression (D2 experiment)
-    id<MTLComputePipelineState> turbo3_quantize;    // turbo3_quantize_kv_256
-    id<MTLComputePipelineState> turbo3_dequantize;  // turbo3_dequantize_kv_256
-    id<MTLBuffer> __strong *buf_kv_k_compressed;    // Compressed K cache per layer (98 bytes/head)
-    id<MTLBuffer> __strong *buf_kv_v_compressed;    // Compressed V cache per layer
-    id<MTLBuffer> buf_turbo_scratch;                // Scratch buffer for dequantized KV
+    id<MTLComputePipelineState> turbo3_quantize;         // turbo3_quantize_kv_256
+    id<MTLComputePipelineState> turbo3_dequantize;       // turbo3_dequantize_kv_256
+    id<MTLComputePipelineState> turbo3_dequantize_batch; // turbo3_dequantize_kv_batch (for attention)
+    id<MTLBuffer> __strong *buf_kv_k_compressed;         // Compressed K cache per layer (98 bytes/head)
+    id<MTLBuffer> __strong *buf_kv_v_compressed;         // Compressed V cache per layer
+    id<MTLBuffer> buf_turbo_k_scratch;                   // Scratch buffer for dequantized K (full seq)
+    id<MTLBuffer> buf_turbo_v_scratch;                   // Scratch buffer for dequantized V (full seq)
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1743,8 +1745,10 @@ static MetalCtx *metal_setup(void) {
     if (g_kv_compression) {
         ctx->turbo3_quantize   = makePipe(@"turbo3_quantize_kv_256");
         ctx->turbo3_dequantize = makePipe(@"turbo3_dequantize_kv_256");
+        ctx->turbo3_dequantize_batch = makePipe(@"turbo3_dequantize_kv_batch");
         if (!ctx->turbo3_quantize)   fprintf(stderr, "[metal] WARNING: turbo3_quantize pipeline failed\n");
         if (!ctx->turbo3_dequantize) fprintf(stderr, "[metal] WARNING: turbo3_dequantize pipeline failed\n");
+        if (!ctx->turbo3_dequantize_batch) fprintf(stderr, "[metal] WARNING: turbo3_dequantize_batch pipeline failed\n");
     }
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
@@ -1867,27 +1871,10 @@ static MetalCtx *metal_setup(void) {
     {
         size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;  // 512
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
-        for (int i = 0; i < cfg.num_full_attn_layers; i++) {
-            ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
-                                                        options:MTLResourceStorageModeShared];
-            ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
-                                                        options:MTLResourceStorageModeShared];
-        }
-        ctx->buf_attn_q      = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        ctx->buf_attn_out    = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
-        printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
-               cfg.num_full_attn_layers, kv_cache_size / 1e6,
-               (double)(cfg.num_attn_heads * cfg.max_seq_len * sizeof(float)) / 1e6);
 
-        // TurboQuant compressed KV cache buffers (D2 experiment)
-        // Storage: 98 bytes per 256-element head (2 bytes norm + 96 bytes 3-bit indices)
-        // vs 512 bytes fp16 = 5.2x compression
+        // TurboQuant: compressed-only storage with shared scratch buffers
+        // Memory savings: instead of 15 layers * 2 * 16.8MB = 504MB fp32,
+        // we use 15 layers * 2 * 1.6MB = 48MB compressed + 2 * 16.8MB scratch = ~82MB
         if (g_kv_compression) {
             size_t turbo3_block_size = 98;  // sizeof(block_turbo3_256)
             size_t turbo3_cache_size = GPU_KV_SEQ * cfg.num_kv_heads * turbo3_block_size;
@@ -1897,13 +1884,37 @@ static MetalCtx *metal_setup(void) {
                 ctx->buf_kv_v_compressed[i] = [ctx->device newBufferWithLength:turbo3_cache_size
                                                                         options:MTLResourceStorageModeShared];
             }
-            // Scratch buffer for dequantized KV (one position at a time during attention)
-            ctx->buf_turbo_scratch = [ctx->device newBufferWithLength:kv_dim * sizeof(float)
-                                                               options:MTLResourceStorageModeShared];
-            printf("[metal] TurboQuant KV compression enabled: %.1f MB compressed (%.1fx vs fp32)\n",
-                   turbo3_cache_size * cfg.num_full_attn_layers * 2 / 1e6,
-                   (float)kv_cache_size / turbo3_cache_size);
+            // Shared scratch buffers for dequantization (full seq length, reused across layers)
+            ctx->buf_turbo_k_scratch = [ctx->device newBufferWithLength:kv_cache_size
+                                                                options:MTLResourceStorageModeShared];
+            ctx->buf_turbo_v_scratch = [ctx->device newBufferWithLength:kv_cache_size
+                                                                options:MTLResourceStorageModeShared];
+            double compressed_total = turbo3_cache_size * cfg.num_full_attn_layers * 2 / 1e6;
+            double scratch_total = kv_cache_size * 2 / 1e6;
+            double fp32_equivalent = kv_cache_size * cfg.num_full_attn_layers * 2 / 1e6;
+            printf("[metal] TurboQuant KV compression: %.1f MB compressed + %.1f MB scratch = %.1f MB total (%.1fx savings vs %.1f MB fp32)\n",
+                   compressed_total, scratch_total, compressed_total + scratch_total,
+                   fp32_equivalent / (compressed_total + scratch_total), fp32_equivalent);
+        } else {
+            // Standard fp32 KV cache per layer
+            for (int i = 0; i < cfg.num_full_attn_layers; i++) {
+                ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                            options:MTLResourceStorageModeShared];
+                ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                            options:MTLResourceStorageModeShared];
+            }
+            printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each)\n",
+                   cfg.num_full_attn_layers, kv_cache_size / 1e6);
         }
+
+        ctx->buf_attn_q      = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_out    = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
     }
 
     // Persistent GPU state buffers for delta-net (linear attention layers)
@@ -5588,30 +5599,27 @@ static void fused_layer_forward(
 
         int fa_idx = cfg.full_attn_index[layer_idx];
         if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                   k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                   v_out, kv_dim * sizeof(float));
-
-            // TurboQuant: quantize KV to compressed buffers (D2 experiment)
-            // This adds overhead but proves the algorithm. Full integration would
-            // use compressed-only storage and dequantize on-demand.
+            // TurboQuant: compressed-only storage — quantize directly to compressed buffers
             if (g_kv_compression && g_metal->turbo3_quantize) {
+                // Copy K/V to scratch (at position 0), then quantize to compressed storage
+                memcpy([g_metal->buf_turbo_k_scratch contents], k_out, kv_dim * sizeof(float));
+                memcpy([g_metal->buf_turbo_v_scratch contents], v_out, kv_dim * sizeof(float));
+
                 id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
                 uint32_t n_heads = cfg.num_kv_heads;  // 2 heads for 122B
 
-                // Quantize K
+                // Quantize K (read from scratch offset 0, write to compressed at cache_pos)
                 [enc setComputePipelineState:g_metal->turbo3_quantize];
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:cache_pos * kv_dim * sizeof(float) atIndex:0];
+                [enc setBuffer:g_metal->buf_turbo_k_scratch offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_kv_k_compressed[fa_idx] offset:cache_pos * n_heads * 98 atIndex:1];
                 [enc setBytes:&n_heads length:sizeof(uint32_t) atIndex:2];
                 [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
 
                 // Quantize V
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:cache_pos * kv_dim * sizeof(float) atIndex:0];
+                [enc setBuffer:g_metal->buf_turbo_v_scratch offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_kv_v_compressed[fa_idx] offset:cache_pos * n_heads * 98 atIndex:1];
                 [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -5619,6 +5627,12 @@ static void fused_layer_forward(
                 [enc endEncoding];
                 [cmd commit];
                 // Don't wait — let it overlap with CPU work
+            } else {
+                // Standard fp32 path
+                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                       k_out, kv_dim * sizeof(float));
+                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                       v_out, kv_dim * sizeof(float));
             }
         }
         kv->len++;
@@ -5920,13 +5934,51 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
+            // TurboQuant: dequantize compressed KV to scratch before attention
+            id<MTLBuffer> kv_k_buf = g_kv_compression ? g_metal->buf_turbo_k_scratch : g_metal->buf_kv_k[fa_idx];
+            id<MTLBuffer> kv_v_buf = g_kv_compression ? g_metal->buf_turbo_v_scratch : g_metal->buf_kv_v[fa_idx];
+
+            if (g_kv_compression && g_metal->turbo3_dequantize_batch) {
+                uint32_t n_kv_heads = cfg.num_kv_heads;
+
+                // Enc D1: dequantize K (compressed -> scratch)
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->turbo3_dequantize_batch];
+                    [enc setBuffer:g_metal->buf_kv_k_compressed[fa_idx] offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_turbo_k_scratch offset:0 atIndex:1];
+                    [enc setBytes:&sl         length:4 atIndex:2];
+                    [enc setBytes:&n_kv_heads length:4 atIndex:3];
+                    [enc setBytes:&hd         length:4 atIndex:4];
+                    uint32_t total_heads = sl * n_kv_heads;
+                    [enc dispatchThreads:MTLSizeMake(total_heads, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    [enc endEncoding];
+                }
+
+                // Enc D2: dequantize V (compressed -> scratch)
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->turbo3_dequantize_batch];
+                    [enc setBuffer:g_metal->buf_kv_v_compressed[fa_idx] offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_turbo_v_scratch offset:0 atIndex:1];
+                    [enc setBytes:&sl         length:4 atIndex:2];
+                    [enc setBytes:&n_kv_heads length:4 atIndex:3];
+                    [enc setBytes:&hd         length:4 atIndex:4];
+                    uint32_t total_heads = sl * n_kv_heads;
+                    [enc dispatchThreads:MTLSizeMake(total_heads, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    [enc endEncoding];
+                }
+            }
+
             // Enc A1: attn_scores_batched
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_scores_pipe];
-                [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                [enc setBuffer:g_metal->buf_attn_q  offset:0 atIndex:0];
+                [enc setBuffer:kv_k_buf             offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:2];
                 [enc setBytes:&hd        length:4 atIndex:3];
                 [enc setBytes:&kvd       length:4 atIndex:4];
                 [enc setBytes:&sl        length:4 atIndex:5];
@@ -5954,9 +6006,9 @@ static void fused_layer_forward(
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_values_pipe];
-                [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
-                [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
+                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                [enc setBuffer:kv_v_buf             offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_out offset:0 atIndex:2];
                 [enc setBytes:&hd        length:4 atIndex:3];
                 [enc setBytes:&kvd       length:4 atIndex:4];
                 [enc setBytes:&sl        length:4 atIndex:5];
@@ -7662,14 +7714,54 @@ static void serve_loop(
                         memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
                         memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                         kv_caches[i]->len = kv_snapshots[i].len;
-                        // Also restore GPU KV mirror
+                        // Also restore GPU KV mirror (or quantize if turbo3)
                         if (g_metal) {
                             int fa_idx = cfg.full_attn_index[i];
                             if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
-                                       kv_snapshots[i].k_snapshot, sz);
-                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
-                                       kv_snapshots[i].v_snapshot, sz);
+                                if (g_kv_compression && g_metal->turbo3_quantize) {
+                                    // TurboQuant: quantize snapshot to compressed storage
+                                    // Copy to scratch, then quantize each position
+                                    memcpy([g_metal->buf_turbo_k_scratch contents],
+                                           kv_snapshots[i].k_snapshot, sz);
+                                    memcpy([g_metal->buf_turbo_v_scratch contents],
+                                           kv_snapshots[i].v_snapshot, sz);
+
+                                    id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+                                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                                    uint32_t n_tokens = sys_prompt_len;
+                                    uint32_t n_kv_heads = cfg.num_kv_heads;
+
+                                    // Quantize K batch
+                                    [enc setComputePipelineState:g_metal->turbo3_quantize];
+                                    for (uint32_t p = 0; p < n_tokens; p++) {
+                                        [enc setBuffer:g_metal->buf_turbo_k_scratch
+                                                offset:p * kv_dim * sizeof(float) atIndex:0];
+                                        [enc setBuffer:g_metal->buf_kv_k_compressed[fa_idx]
+                                                offset:p * n_kv_heads * 98 atIndex:1];
+                                        [enc setBytes:&n_kv_heads length:4 atIndex:2];
+                                        [enc dispatchThreads:MTLSizeMake(n_kv_heads, 1, 1)
+                                               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                                    }
+                                    // Quantize V batch
+                                    for (uint32_t p = 0; p < n_tokens; p++) {
+                                        [enc setBuffer:g_metal->buf_turbo_v_scratch
+                                                offset:p * kv_dim * sizeof(float) atIndex:0];
+                                        [enc setBuffer:g_metal->buf_kv_v_compressed[fa_idx]
+                                                offset:p * n_kv_heads * 98 atIndex:1];
+                                        [enc setBytes:&n_kv_heads length:4 atIndex:2];
+                                        [enc dispatchThreads:MTLSizeMake(n_kv_heads, 1, 1)
+                                               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                                    }
+                                    [enc endEncoding];
+                                    [cmd commit];
+                                    [cmd waitUntilCompleted];  // Need to wait for restore
+                                } else {
+                                    // Standard fp32 path
+                                    memcpy([g_metal->buf_kv_k[fa_idx] contents],
+                                           kv_snapshots[i].k_snapshot, sz);
+                                    memcpy([g_metal->buf_kv_v[fa_idx] contents],
+                                           kv_snapshots[i].v_snapshot, sz);
+                                }
                             }
                         }
                     } else if (kv_caches[i]) {
