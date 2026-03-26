@@ -37,3 +37,4 @@ pin+nocache	1.24	16.18	64	pin-weights + F_NOCACHE — no improvement
 k6-128tok	1.57	12.30	128	K=6 sustained 128 tokens
 k5-compound	1.94	10.72	64	K=5 + pin-weights + nocache — no additional gain
 k6-compound	1.63	12.38	64	K=6 + pin-weights + nocache — no additional gain
+turbo3-kv-infra	1.86	12.96	3	TurboQuant infra working — 38.5MB compressed KV (5.2x vs fp32), quantize async

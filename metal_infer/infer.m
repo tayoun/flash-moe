@@ -5592,6 +5592,34 @@ static void fused_layer_forward(
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
                    v_out, kv_dim * sizeof(float));
+
+            // TurboQuant: quantize KV to compressed buffers (D2 experiment)
+            // This adds overhead but proves the algorithm. Full integration would
+            // use compressed-only storage and dequantize on-demand.
+            if (g_kv_compression && g_metal->turbo3_quantize) {
+                id<MTLCommandBuffer> cmd = [g_metal->queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+                uint32_t n_heads = cfg.num_kv_heads;  // 2 heads for 122B
+
+                // Quantize K
+                [enc setComputePipelineState:g_metal->turbo3_quantize];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:cache_pos * kv_dim * sizeof(float) atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k_compressed[fa_idx] offset:cache_pos * n_heads * 98 atIndex:1];
+                [enc setBytes:&n_heads length:sizeof(uint32_t) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+
+                // Quantize V
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:cache_pos * kv_dim * sizeof(float) atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_v_compressed[fa_idx] offset:cache_pos * n_heads * 98 atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+
+                [enc endEncoding];
+                [cmd commit];
+                // Don't wait — let it overlap with CPU work
+            }
         }
         kv->len++;
 
