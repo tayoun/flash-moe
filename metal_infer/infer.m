@@ -1231,6 +1231,32 @@ static void init_tokenizer(void) {
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
 }
 
+// Process C-style escape sequences in a string (for CLI --prompt).
+// Handles: \n \t \r \\
+// Returns newly allocated string (caller must free).
+static char *process_escape_sequences(const char *input) {
+    size_t len = strlen(input);
+    char *output = malloc(len + 1);  // output is always <= input length
+    if (!output) return NULL;
+
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (input[i] == '\\' && i + 1 < len) {
+            switch (input[i + 1]) {
+                case 'n':  output[j++] = '\n'; i++; break;
+                case 't':  output[j++] = '\t'; i++; break;
+                case 'r':  output[j++] = '\r'; i++; break;
+                case '\\': output[j++] = '\\'; i++; break;
+                default:   output[j++] = input[i]; break;
+            }
+        } else {
+            output[j++] = input[i];
+        }
+    }
+    output[j] = '\0';
+    return output;
+}
+
 static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
     init_tokenizer();
     if (!g_tokenizer_loaded) return NULL;
@@ -8044,7 +8070,7 @@ static void print_usage(const char *prog) {
     printf("  --manifest PATH      model_weights.json path (auto-detected from model dir)\n");
     printf("  --vocab PATH         vocab.bin path (default: metal_infer/vocab.bin or vocab.bin)\n");
     printf("  --prompt-tokens PATH tokenizer.bin / prompt_tokens.bin path (default: metal_infer/tokenizer.bin or tokenizer.bin)\n");
-    printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
+    printf("  --prompt TEXT         Prompt text (supports \\\\n, \\\\t, \\\\r escape sequences)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: from config num_experts_per_tok)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
@@ -8507,7 +8533,14 @@ int main(int argc, char **argv) {
         PromptTokens *pt = NULL;
         if (serve_port == 0) {
             if (prompt_text) {
-                pt = encode_prompt_text_to_tokens(prompt_text);
+                // Process C-style escape sequences (e.g., \n -> newline) for CLI prompts
+                char *processed_prompt = process_escape_sequences(prompt_text);
+                if (!processed_prompt) {
+                    fprintf(stderr, "ERROR: Failed to process prompt escape sequences\n");
+                    return 1;
+                }
+                pt = encode_prompt_text_to_tokens(processed_prompt);
+                free(processed_prompt);
                 if (!pt) {
                     fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
                     return 1;
