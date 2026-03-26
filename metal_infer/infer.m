@@ -477,6 +477,13 @@ static uint64_t g_pred_layers = 0;
 static FILE *g_routing_log = NULL;
 static int g_routing_log_samples = 0;
 
+// Trace file for offline cache simulation (A1 experiment)
+// Binary format: Header [4 int32: num_layers, num_experts, K, expert_size]
+//                Per-token: [K int32 expert_indices] × num_layers
+static FILE *g_trace_file = NULL;
+static int g_trace_token_count = 0;
+static int g_trace_header_written = 0;
+
 // LZ4 compressed expert support
 // File format: [LZ4IndexEntry × 512] + [compressed blobs]
 typedef struct {
@@ -6254,6 +6261,21 @@ static void fused_layer_forward(
         g_routing_log_samples++;
     }
 
+    // Write compact routing trace for cache simulation (A1 experiment)
+    if (g_trace_file) {
+        int32_t ki = (K > MAX_K) ? MAX_K : K;
+        // Pad with -1 if K < MAX_K (for consistent record size)
+        int32_t padded[MAX_K];
+        for (int i = 0; i < MAX_K; i++) {
+            padded[i] = (i < ki) ? expert_indices[i] : -1;
+        }
+        fwrite(padded, sizeof(int32_t), MAX_K, g_trace_file);
+        // Increment token count at last layer
+        if (layer_idx == cfg.num_layers - 1) {
+            g_trace_token_count++;
+        }
+    }
+
     // ---- CAR dry-run: measure residency and substitution potential ----
     if (g_car_dry && g_layer_mmaps) {
         int uncached = 0;
@@ -8095,6 +8117,7 @@ static void print_usage(const char *prog) {
     printf("  --top-k N            Top-k sampling (default: 20, 0=disabled)\n");
     printf("  --top-p F            Top-p/nucleus sampling (default: 0.95)\n");
     printf("  --kv-compression M   KV cache compression: none (default), turbo3 (4.6x)\n");
+    printf("  --trace PATH         Dump routing trace for offline cache simulation (simulate.py)\n");
     printf("  --help               This message\n");
 }
 
@@ -8154,6 +8177,7 @@ int main(int argc, char **argv) {
             {"top-k",         required_argument, 0, 272},
             {"top-p",         required_argument, 0, 273},
             {"kv-compression", required_argument, 0, 274},
+            {"trace",         required_argument, 0, 275},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8268,6 +8292,15 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     break;
+                case 275:
+                    // --trace <path>: dump routing trace for offline cache simulation
+                    g_trace_file = fopen(optarg, "wb");
+                    if (!g_trace_file) {
+                        fprintf(stderr, "ERROR: cannot open trace file: %s\n", optarg);
+                        return 1;
+                    }
+                    printf("[config] Routing trace: %s (for simulate.py)\n", optarg);
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8283,6 +8316,20 @@ int main(int argc, char **argv) {
         if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+
+        // Write trace header if trace file enabled
+        if (g_trace_file) {
+            int32_t hdr[4] = {
+                (int32_t)cfg.num_layers,
+                (int32_t)cfg.num_experts,
+                (int32_t)K,
+                (int32_t)cfg.expert_size_4bit
+            };
+            fwrite(hdr, sizeof(int32_t), 4, g_trace_file);
+            g_trace_header_written = 1;
+            printf("[trace] Header written: %d layers, %d experts, K=%d, expert_size=%zu\n",
+                   cfg.num_layers, cfg.num_experts, K, cfg.expert_size_4bit);
+        }
 
         // Load expert permutation (for clustered layout)
         if (g_permutation_path) {
@@ -9065,6 +9112,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",
                     g_routing_log_samples);
             g_routing_log = NULL;
+        }
+
+        if (g_trace_file) {
+            fclose(g_trace_file);
+            printf("[trace] Logged %d tokens to trace file (use simulate.py to analyze)\n",
+                   g_trace_token_count);
+            g_trace_file = NULL;
         }
 
         // ---- Cleanup ----
