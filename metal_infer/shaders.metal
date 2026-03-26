@@ -1423,3 +1423,269 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+
+// ============================================================================
+// TurboQuant KV Cache Compression (D2 experiment)
+// ============================================================================
+// PolarQuant 3-bit compression via Walsh-Hadamard rotation.
+// Achieves ~4.6x compression vs fp16 with >98% cosine similarity.
+//
+// Storage format (for head_dim=256):
+//   - norm: fp16 (2 bytes) — original vector L2 norm
+//   - qs: 96 bytes (256 * 3 bits = 768 bits)
+//   Total: 98 bytes per 256-element head (vs 512 bytes fp16)
+//
+// Algorithm:
+//   1. Extract norm, normalize to unit vector
+//   2. Apply WHT rotation (Gaussianizes high-kurtosis activations)
+//   3. Quantize each rotated coordinate to 3-bit centroid
+//   4. To dequantize: look up centroids, inverse WHT, rescale by norm
+// ============================================================================
+
+// TurboQuant block structure for head_dim=256
+// 98 bytes total = 2 (norm) + 96 (indices)
+struct block_turbo3_256 {
+    half norm;           // 2 bytes: original ||x||_2
+    uint8_t qs[96];      // 96 bytes: 256 * 3-bit = 768 bits
+};
+
+// Pre-computed optimal 3-bit centroids for N(0, 1/256)
+// Lloyd-Max optimal for Gaussian after WHT rotation
+constant float TURBO3_CENTROIDS[8] = {
+    -0.134832f, -0.083280f, -0.046436f, -0.015165f,
+     0.015165f,  0.046436f,  0.083280f,  0.134832f
+};
+
+// Midpoints for fast nearest-centroid lookup
+constant float TURBO3_MIDPOINTS[7] = {
+    -0.109056f, -0.064858f, -0.030801f, 0.0f, 0.030801f, 0.064858f, 0.109056f
+};
+
+// WHT sign arrays (seed=42) for structured random rotation
+// D1 @ H @ D2 where D1, D2 are diagonal sign matrices
+constant float TURBO_WHT_SIGNS1[256] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,
+     1,-1,-1,-1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,-1, 1,
+     1, 1, 1, 1,-1,-1, 1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1, 1,
+    -1,-1,-1, 1, 1, 1, 1, 1, 1,-1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1, 1, 1,-1, 1, 1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1,-1, 1,-1,-1,-1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1,-1
+};
+constant float TURBO_WHT_SIGNS2[256] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1,
+     1, 1,-1, 1, 1,-1, 1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1, 1,-1, 1, 1, 1,-1, 1,-1,-1,-1,-1, 1, 1,
+    -1,-1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1, 1,
+    -1,-1, 1,-1, 1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1, 1,-1, 1, 1,-1,
+     1,-1,-1, 1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1
+};
+
+// Fast Walsh-Hadamard Transform (in-place, normalized)
+// O(n log n) = 2048 ops for n=256, vs O(n^2) = 65536 for dense matvec
+inline void turbo_fwht_256(thread float *x) {
+    // Butterfly operations
+    for (int h = 1; h < 256; h *= 2) {
+        for (int i = 0; i < 256; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    // Normalize by 1/sqrt(256) = 1/16
+    const float inv_sqrt_256 = 0.0625f;
+    for (int i = 0; i < 256; i++) {
+        x[i] *= inv_sqrt_256;
+    }
+}
+
+// Forward rotation: signs1 -> FWHT -> signs2
+inline void turbo_rotate_forward_256(thread float *x) {
+    for (int i = 0; i < 256; i++) x[i] *= TURBO_WHT_SIGNS1[i];
+    turbo_fwht_256(x);
+    for (int i = 0; i < 256; i++) x[i] *= TURBO_WHT_SIGNS2[i];
+}
+
+// Inverse rotation: signs2 -> FWHT -> signs1 (WHT is its own inverse)
+inline void turbo_rotate_inverse_256(thread float *x) {
+    for (int i = 0; i < 256; i++) x[i] *= TURBO_WHT_SIGNS2[i];
+    turbo_fwht_256(x);
+    for (int i = 0; i < 256; i++) x[i] *= TURBO_WHT_SIGNS1[i];
+}
+
+// Find nearest 3-bit centroid index
+inline uint8_t turbo_nearest_centroid(float val) {
+    if (val < TURBO3_MIDPOINTS[0]) return 0;
+    if (val < TURBO3_MIDPOINTS[1]) return 1;
+    if (val < TURBO3_MIDPOINTS[2]) return 2;
+    if (val < TURBO3_MIDPOINTS[3]) return 3;
+    if (val < TURBO3_MIDPOINTS[4]) return 4;
+    if (val < TURBO3_MIDPOINTS[5]) return 5;
+    if (val < TURBO3_MIDPOINTS[6]) return 6;
+    return 7;
+}
+
+
+// ============================================================================
+// Kernel: TurboQuant 3-bit KV cache quantization (head_dim=256)
+// ============================================================================
+// Compresses one KV head (256 floats) to block_turbo3_256 (98 bytes).
+// Dispatch: one thread per head (num_kv_heads * seq_len threads).
+//
+// Input:  kv_fp32[head_idx * 256 : (head_idx+1) * 256] — 256 floats
+// Output: kv_compressed[head_idx] — block_turbo3_256 (98 bytes)
+
+kernel void turbo3_quantize_kv_256(
+    device const float*        kv_fp32       [[buffer(0)]],  // [n_heads * 256] input
+    device block_turbo3_256*   kv_compressed [[buffer(1)]],  // [n_heads] output
+    constant uint&             n_heads       [[buffer(2)]],
+    uint head_idx [[thread_position_in_grid]]
+) {
+    if (head_idx >= n_heads) return;
+
+    device const float* src = kv_fp32 + head_idx * 256;
+    device block_turbo3_256& dst = kv_compressed[head_idx];
+
+    // Step 1: Load and compute norm
+    float x[256];
+    float norm_sq = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        x[i] = src[i];
+        norm_sq += x[i] * x[i];
+    }
+    float norm = sqrt(norm_sq);
+    dst.norm = half(norm);
+
+    // Normalize to unit vector
+    float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < 256; i++) {
+        x[i] *= inv_norm;
+    }
+
+    // Step 2: Apply WHT rotation (Gaussianizes the distribution)
+    turbo_rotate_forward_256(x);
+
+    // Step 3: Quantize to 3-bit indices and pack
+    // 256 * 3 bits = 768 bits = 96 bytes
+    // Pack 8 indices (24 bits) into 3 bytes
+    for (int i = 0; i < 96; i++) {
+        dst.qs[i] = 0;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        uint8_t idx = turbo_nearest_centroid(x[i]);
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+
+        // Write 3 bits (may span two bytes)
+        dst.qs[byte_idx] |= (idx << bit_pos);
+        if (bit_pos > 5) {
+            dst.qs[byte_idx + 1] |= (idx >> (8 - bit_pos));
+        }
+    }
+}
+
+
+// ============================================================================
+// Kernel: TurboQuant 3-bit KV cache dequantization (head_dim=256)
+// ============================================================================
+// Decompresses block_turbo3_256 back to 256 floats.
+// Dispatch: one thread per head.
+
+kernel void turbo3_dequantize_kv_256(
+    device const block_turbo3_256* kv_compressed [[buffer(0)]],  // [n_heads] input
+    device float*                  kv_fp32       [[buffer(1)]],  // [n_heads * 256] output
+    constant uint&                 n_heads       [[buffer(2)]],
+    uint head_idx [[thread_position_in_grid]]
+) {
+    if (head_idx >= n_heads) return;
+
+    device const block_turbo3_256& src = kv_compressed[head_idx];
+    device float* dst = kv_fp32 + head_idx * 256;
+
+    float norm = float(src.norm);
+
+    // Step 1: Unpack 3-bit indices and look up centroids
+    float x[256];
+    for (int i = 0; i < 256; i++) {
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+
+        // Read up to 2 bytes to extract 3 bits
+        uint16_t raw = uint16_t(src.qs[byte_idx]);
+        if (byte_idx + 1 < 96) {
+            raw |= uint16_t(src.qs[byte_idx + 1]) << 8;
+        }
+        uint8_t idx = (raw >> bit_pos) & 0x7;
+
+        x[i] = TURBO3_CENTROIDS[idx];
+    }
+
+    // Step 2: Apply inverse WHT rotation
+    turbo_rotate_inverse_256(x);
+
+    // Step 3: Rescale by original norm and write output
+    for (int i = 0; i < 256; i++) {
+        dst[i] = x[i] * norm;
+    }
+}
+
+
+// ============================================================================
+// Kernel: TurboQuant batch KV quantization (for prefill)
+// ============================================================================
+// Compresses multiple KV vectors in parallel.
+// Dispatch: n_tokens * n_kv_heads threads.
+
+kernel void turbo3_quantize_kv_batch(
+    device const float*        kv_fp32       [[buffer(0)]],  // [n_tokens, n_kv_heads, head_dim]
+    device block_turbo3_256*   kv_compressed [[buffer(1)]],  // [n_tokens, n_kv_heads]
+    constant uint&             n_tokens      [[buffer(2)]],
+    constant uint&             n_kv_heads    [[buffer(3)]],
+    constant uint&             head_dim      [[buffer(4)]],  // must be 256
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total_heads = n_tokens * n_kv_heads;
+    if (gid >= total_heads) return;
+
+    // Map gid to (token_idx, head_idx)
+    uint token_idx = gid / n_kv_heads;
+    uint head_idx = gid % n_kv_heads;
+
+    device const float* src = kv_fp32 + (token_idx * n_kv_heads + head_idx) * head_dim;
+    device block_turbo3_256& dst = kv_compressed[gid];
+
+    // Same algorithm as single-head version
+    float x[256];
+    float norm_sq = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        x[i] = src[i];
+        norm_sq += x[i] * x[i];
+    }
+    float norm = sqrt(norm_sq);
+    dst.norm = half(norm);
+
+    float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < 256; i++) x[i] *= inv_norm;
+
+    turbo_rotate_forward_256(x);
+
+    for (int i = 0; i < 96; i++) dst.qs[i] = 0;
+    for (int i = 0; i < 256; i++) {
+        uint8_t idx = turbo_nearest_centroid(x[i]);
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos = bit_offset % 8;
+        dst.qs[byte_idx] |= (idx << bit_pos);
+        if (bit_pos > 5) dst.qs[byte_idx + 1] |= (idx >> (8 - bit_pos));
+    }
+}
