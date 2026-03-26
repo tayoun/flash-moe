@@ -503,6 +503,7 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_prefill_k = -1;     // K used during prefill (-1 = use same K as decode)
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
@@ -7865,6 +7866,9 @@ static void serve_loop(
                     embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * cfg.hidden_dim);
                 }
             }
+            // Use g_prefill_k during prefill if set (experiment B1.1)
+            int serve_prefill_k = (g_prefill_k >= 0) ? g_prefill_k : K;
+
             // Intermediate prefill tokens: discard last-layer expert output
             for (int i = 0; i < pt->count - 1; i++) {
                 cache_telemetry_note_token();
@@ -7881,7 +7885,7 @@ static void serve_loop(
                                         is_full ? NULL : layer_states[layer],
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                                        serve_prefill_k, layer_fds[layer]);
                 }
                 discard_deferred_experts();
                 pos++;
@@ -7902,7 +7906,7 @@ static void serve_loop(
                                         is_full ? NULL : layer_states[layer],
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                                        serve_prefill_k, layer_fds[layer]);
                 }
                 complete_deferred_experts();
                 pos++;
@@ -8118,6 +8122,7 @@ static void print_usage(const char *prog) {
     printf("  --top-p F            Top-p/nucleus sampling (default: 0.95)\n");
     printf("  --kv-compression M   KV cache compression: none (default), turbo3 (4.6x)\n");
     printf("  --trace PATH         Dump routing trace for offline cache simulation (simulate.py)\n");
+    printf("  --prefill-k N        K used during prefill (0=shared only, establishes TTFT floor)\n");
     printf("  --help               This message\n");
 }
 
@@ -8178,6 +8183,7 @@ int main(int argc, char **argv) {
             {"top-p",         required_argument, 0, 273},
             {"kv-compression", required_argument, 0, 274},
             {"trace",         required_argument, 0, 275},
+            {"prefill-k",     required_argument, 0, 276},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8300,6 +8306,11 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     printf("[config] Routing trace: %s (for simulate.py)\n", optarg);
+                    break;
+                case 276:
+                    // --prefill-k N: use different K during prefill (0 = shared expert only)
+                    g_prefill_k = atoi(optarg);
+                    printf("[config] Prefill K=%d (decode uses default K)\n", g_prefill_k);
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -8857,6 +8868,9 @@ int main(int argc, char **argv) {
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
 
+            // Use g_prefill_k during prefill if set (experiment B1.1)
+            int prefill_k = (g_prefill_k >= 0) ? g_prefill_k : K;
+
             for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
                 double t_tok = now_ms();
 
@@ -8873,7 +8887,7 @@ int main(int argc, char **argv) {
                                         is_full ? NULL : layer_states[layer],
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                                        prefill_k, layer_fds[layer]);
                 }
 
                 // Discard last layer's expert output — hidden will be overwritten
@@ -8895,7 +8909,10 @@ int main(int argc, char **argv) {
 
         // ---- Last prefill token (or single-token prompt) ----
         // This one needs full completion since we need hidden state for logits.
+        // Note: last prefill token ALSO uses prefill_k (not decode K) — the internal
+        // state will still be primed correctly from shared expert activations.
         {
+            int prefill_k = (g_prefill_k >= 0) ? g_prefill_k : K;
             cache_telemetry_note_token();
             if (embed_batch) {
                 memcpy(hidden, embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
@@ -8911,7 +8928,7 @@ int main(int argc, char **argv) {
                                     is_full ? NULL : layer_states[layer],
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
+                                    prefill_k, layer_fds[layer]);
             }
             // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();

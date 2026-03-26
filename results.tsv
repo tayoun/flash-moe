@@ -41,3 +41,4 @@ turbo3-kv-infra	1.86	12.96	3	TurboQuant infra working — 38.5MB compressed KV (
 turbo3-kv-compression	1.72	8.46	32	TurboQuant 3-bit KV cache: 5.6x memory savings (72MB vs 403MB fp32), quality verified via HTTP server
 c4-kernel-study	-	-	-	Analyzed llama.cpp metal kernels. Fused RMSNorm, flash attention patterns documented. Deferred: GPU is only 26-30% of time on I/O-bound 122B
 a1-trace-simulator	-	-	-	Added --trace flag to infer, updated simulate.py. Trace capture + offline cache simulation working
+prefill-k0-baseline	1.35	4.19	64	K=0 prefill + K=6 decode: 2x TTFT improvement, quality preserved
