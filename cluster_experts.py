@@ -22,7 +22,9 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+import random
 import shutil
 import sys
 import time
@@ -67,6 +69,81 @@ def greedy_cluster(cooccur_matrix, num_experts):
         current = best_next
 
     return order
+
+
+def adjacency_score(order, cooccur_matrix):
+    """Compute sum of co-occurrence between adjacent experts in ordering."""
+    return sum(cooccur_matrix[order[i]][order[i+1]] for i in range(len(order) - 1))
+
+
+def simulated_annealing(cooccur_matrix, num_experts, initial_order=None,
+                        max_iters=10000, initial_temp=1.0, cooling_rate=0.9995):
+    """Simulated annealing to optimize expert ordering for adjacency locality.
+
+    Starts from greedy solution, randomly swaps pairs, accepts improvements
+    and sometimes worse solutions based on temperature (annealing schedule).
+    """
+    # Start from greedy solution if no initial order provided
+    if initial_order is None:
+        order = greedy_cluster(cooccur_matrix, num_experts)
+    else:
+        order = list(initial_order)
+
+    current_score = adjacency_score(order, cooccur_matrix)
+    best_order = list(order)
+    best_score = current_score
+
+    temp = initial_temp
+    accepts = 0
+    improves = 0
+
+    for iteration in range(max_iters):
+        # Pick two random positions to swap
+        i, j = random.sample(range(num_experts), 2)
+
+        # Compute delta in adjacency score from this swap
+        # Only affected edges are: (i-1,i), (i,i+1), (j-1,j), (j,j+1)
+        old_contrib = 0
+        new_contrib = 0
+
+        for pos in [i, j]:
+            if pos > 0:
+                old_contrib += cooccur_matrix[order[pos-1]][order[pos]]
+            if pos < num_experts - 1:
+                old_contrib += cooccur_matrix[order[pos]][order[pos+1]]
+
+        # Swap
+        order[i], order[j] = order[j], order[i]
+
+        for pos in [i, j]:
+            if pos > 0:
+                new_contrib += cooccur_matrix[order[pos-1]][order[pos]]
+            if pos < num_experts - 1:
+                new_contrib += cooccur_matrix[order[pos]][order[pos+1]]
+
+        delta = new_contrib - old_contrib
+
+        # Accept or reject
+        if delta > 0:
+            # Always accept improvements
+            current_score += delta
+            accepts += 1
+            improves += 1
+            if current_score > best_score:
+                best_score = current_score
+                best_order = list(order)
+        elif temp > 0 and random.random() < math.exp(delta / (temp * best_score / 100 + 1e-10)):
+            # Sometimes accept worse solutions
+            current_score += delta
+            accepts += 1
+        else:
+            # Reject - swap back
+            order[i], order[j] = order[j], order[i]
+
+        # Cool down
+        temp *= cooling_rate
+
+    return best_order, best_score, accepts, improves
 
 
 def repack_layer(layer_idx, order, packed_dir, output_dir, expert_size, in_place=False):
@@ -138,6 +215,11 @@ def main():
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show clustering stats without repacking')
+    parser.add_argument('--algorithm', default='greedy',
+                        choices=['greedy', 'annealing'],
+                        help='Clustering algorithm: greedy (fast) or annealing (better)')
+    parser.add_argument('--annealing-iters', type=int, default=50000,
+                        help='Simulated annealing iterations per layer (default: 50000)')
     args = parser.parse_args()
 
     # Load layout from source dir
@@ -190,6 +272,8 @@ def main():
     total_adjacency_before = 0
     total_adjacency_after = 0
 
+    print(f"Algorithm: {args.algorithm}" + (f" ({args.annealing_iters} iters)" if args.algorithm == 'annealing' else ""))
+
     for layer_idx in layers:
         layer_key = str(layer_idx)
         if layer_key not in cooccur_data['layers']:
@@ -198,27 +282,26 @@ def main():
             continue
 
         matrix = cooccur_data['layers'][layer_key]
-        order = greedy_cluster(matrix, num_experts)
-        permutations[layer_idx] = order
 
-        # Build inverse map: old_id -> new_position
-        inverse = [0] * num_experts
-        for new_pos, old_id in enumerate(order):
-            inverse[old_id] = new_pos
-
-        # Compute adjacency score: sum of co-occurrence between adjacent experts
-        # Before: experts 0,1,2,... are adjacent (identity ordering)
+        # Compute baseline adjacency score (identity ordering)
         adj_before = sum(matrix[e][e+1] for e in range(num_experts - 1))
-        # After: experts in new order
-        adj_after = sum(matrix[order[i]][order[i+1]] for i in range(num_experts - 1))
+
+        if args.algorithm == 'annealing':
+            order, adj_after, accepts, improves = simulated_annealing(
+                matrix, num_experts, max_iters=args.annealing_iters)
+            extra = f" (accepts={accepts}, improves={improves})"
+        else:
+            order = greedy_cluster(matrix, num_experts)
+            adj_after = adjacency_score(order, matrix)
+            extra = ""
+
+        permutations[layer_idx] = order
 
         total_adjacency_before += adj_before
         total_adjacency_after += adj_after
 
-        # Count how many of the K=8 routed experts land within a "cluster" of 8 adjacent positions
-        # This is the key metric for read coalescing
         print(f"  Layer {layer_idx:2d}: adjacency score {adj_before} -> {adj_after} "
-              f"({adj_after / max(adj_before, 1):.1f}x)")
+              f"({adj_after / max(adj_before, 1):.1f}x){extra}")
 
     print(f"\nTotal adjacency: {total_adjacency_before} -> {total_adjacency_after} "
           f"({total_adjacency_after / max(total_adjacency_before, 1):.1f}x improvement)")

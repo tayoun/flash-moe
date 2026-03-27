@@ -49,3 +49,5 @@ b1.2-prefill-k0	1.81	4.94	64	B1.2: K=0 prefill with C1 fused kernel — best TTF
 b1.2-prefill-k2	1.67	8.69	64	B1.2: K=2 prefill — slower decode than K=0 (cache churn?)
 b1.2-prefill-k4	1.87	11.17	64	B1.2: K=4 prefill — best decode, acceptable TTFT
 b1.2-prefill-k6	1.87	13.74	64	B1.2: K=6 prefill (full K) — same decode as K=4, highest TTFT
+a5-lz4-skip	-	-	-	A5: LZ4 skipped — only 21% of layers compress >1.3x (threshold not met)
+a3-annealing-skip	-	-	-	A3: SA adds +2.9% adjacency vs greedy — preadv coalescing already implemented, marginal benefit
