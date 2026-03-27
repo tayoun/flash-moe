@@ -44,3 +44,4 @@ a1-trace-simulator	-	-	-	Added --trace flag to infer, updated simulate.py. Trace
 prefill-k0-baseline	1.35	4.19	64	K=0 prefill + K=6 decode: 2x TTFT improvement, quality preserved
 d1-cache-mb-4gb	-	-	-	--cache-mb flag converts MB to entries; memory budget summary at startup
 a2-composite-score	-	-	-	--cache-composite flag adds LRU+frequency eviction to expert cache
+c1-fused-gate-up-swiglu	1.61	4.50	64	C1: fused gate+up+swiglu kernel — +19% decode (1.61 vs 1.35), reduces 3 dispatches to 1

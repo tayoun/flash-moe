@@ -230,6 +230,91 @@ kernel void fused_gate_up_swiglu(
 }
 
 // ============================================================================
+// Fused gate+up+SwiGLU v3: optimized version with shared memory input cache
+// ============================================================================
+// Same optimization as dequant_matvec_4bit_v3: 8 rows per TG, shared x cache.
+// Computes gate and up in parallel, then applies SwiGLU = silu(gate) * up.
+// Saves 2 input reads + 2 intermediate buffer writes per expert.
+// Dispatch: (out_dim + 7) / 8 threadgroups, 256 threads each.
+
+#define FUSED_ROWS_PER_TG 8
+
+kernel void fused_gate_up_swiglu_v3(
+    device const uint32_t* gate_W    [[buffer(0)]],   // [out_dim, in_dim/8]
+    device const uint16_t* gate_s    [[buffer(1)]],   // [out_dim, num_groups]
+    device const uint16_t* gate_b    [[buffer(2)]],   // [out_dim, num_groups]
+    device const uint32_t* up_W      [[buffer(3)]],   // [out_dim, in_dim/8]
+    device const uint16_t* up_s      [[buffer(4)]],   // [out_dim, num_groups]
+    device const uint16_t* up_b      [[buffer(5)]],   // [out_dim, num_groups]
+    device const float*    x         [[buffer(6)]],   // [in_dim]
+    device float*          out       [[buffer(7)]],   // [out_dim] SwiGLU output
+    constant uint&         out_dim   [[buffer(8)]],
+    constant uint&         in_dim    [[buffer(9)]],
+    constant uint&         group_size [[buffer(10)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * FUSED_ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Cache input vector in shared memory (load once, use for both gate and up)
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    // Pointers for this row
+    device const uint32_t* gate_row = gate_W + row * packed_cols;
+    device const uint16_t* gate_sc  = gate_s + row * num_groups;
+    device const uint16_t* gate_bi  = gate_b + row * num_groups;
+    device const uint32_t* up_row   = up_W + row * packed_cols;
+    device const uint16_t* up_sc    = up_s + row * num_groups;
+    device const uint16_t* up_bi    = up_b + row * num_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+
+    // Process both gate and up in parallel, using cached x
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float g_scale = bf16_to_f32(gate_sc[g]);
+        float g_bias  = bf16_to_f32(gate_bi[g]);
+        float u_scale = bf16_to_f32(up_sc[g]);
+        float u_bias  = bf16_to_f32(up_bi[g]);
+
+        uint32_t gate_packed = gate_row[col];
+        uint32_t up_packed   = up_row[col];
+        uint x_base = col * 8;
+
+        // Unroll 8 nibbles for both gate and up
+        #pragma unroll
+        for (uint n = 0; n < 8; n++) {
+            float xv = x_shared[x_base + n];
+            float g_sx = g_scale * xv, g_bx = g_bias * xv;
+            float u_sx = u_scale * xv, u_bx = u_bias * xv;
+            gate_acc += fma(float((gate_packed >> (n*4)) & 0xF), g_sx, g_bx);
+            up_acc   += fma(float((up_packed >> (n*4)) & 0xF), u_sx, u_bx);
+        }
+    }
+
+    // SIMD reduction for both accumulators
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum   = simd_sum(up_acc);
+
+    // Lane 0 applies SwiGLU and writes result
+    if (simd_lane == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        out[row] = silu_gate * up_sum;
+    }
+}
+
+// ============================================================================
 // Kernel 1c: FULLY OPTIMIZED 4-bit dequant matvec
 // ============================================================================
 //
