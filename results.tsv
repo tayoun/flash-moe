@@ -51,3 +51,5 @@ b1.2-prefill-k4	1.87	11.17	64	B1.2: K=4 prefill — best decode, acceptable TTFT
 b1.2-prefill-k6	1.87	13.74	64	B1.2: K=6 prefill (full K) — same decode as K=4, highest TTFT
 a5-lz4-skip	-	-	-	A5: LZ4 skipped — only 21% of layers compress >1.3x (threshold not met)
 a3-annealing-skip	-	-	-	A3: SA adds +2.9% adjacency vs greedy — preadv coalescing already implemented, marginal benefit
+e1-k6-quality	1.55	19.35	150	E1: K=6 quality validated — factual+logic correct, +17% vs K=8
+e1-k5-quality	1.81	17.47	150	E1: K=5 quality validated — factual+logic correct, +37% vs K=8
