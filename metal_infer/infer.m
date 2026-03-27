@@ -4438,6 +4438,7 @@ typedef struct {
     int *layer_idx;        // [max_entries] layer index for each entry
     int *expert_idx;       // [max_entries] expert index for each entry
     uint64_t *last_used;   // [max_entries] monotonic counter for LRU
+    uint32_t *freq_count;  // [max_entries] access frequency for composite scoring (A2)
     int max_entries;
     int num_entries;
     int used_entries;
@@ -4446,6 +4447,9 @@ typedef struct {
     uint64_t hits;
     uint64_t misses;
 } MallocExpertCache;
+
+// A2: Composite scoring for cache eviction (LRU + frequency)
+static int g_cache_composite_scoring = 0;  // enabled by --cache-composite
 
 static MallocExpertCache *g_malloc_cache = NULL;
 
@@ -4456,6 +4460,7 @@ static MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> devic
     cache->layer_idx = calloc(max_entries, sizeof(int));
     cache->expert_idx = calloc(max_entries, sizeof(int));
     cache->last_used = calloc(max_entries, sizeof(uint64_t));
+    cache->freq_count = calloc(max_entries, sizeof(uint32_t));  // A2: frequency tracking
     cache->entry_idx = malloc(cfg.num_layers * cfg.num_experts * sizeof(int));
     cache->max_entries = max_entries;
     cache->num_entries = 0;
@@ -4512,6 +4517,7 @@ static id<MTLBuffer> malloc_cache_lookup(MallocExpertCache *cache, int layer, in
     int idx = cache->entry_idx[(layer) * cfg.num_experts + (expert)];
     if (idx >= 0) {
         cache->last_used[idx] = ++cache->access_counter;
+        cache->freq_count[idx]++;  // A2: track access frequency
         cache->hits++;
         cache_telemetry_touch(layer, expert);
         return cache->metal_bufs[idx];
@@ -4538,13 +4544,28 @@ static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, in
     }
 
     if (target < 0) {
-        // Cache full: evict entry with smallest last_used
+        // Cache full: evict entry with lowest score
         target = 0;
-        uint64_t min_used = cache->last_used[0];
-        for (int i = 1; i < cache->num_entries; i++) {
-            if (cache->last_used[i] < min_used) {
-                min_used = cache->last_used[i];
-                target = i;
+        if (g_cache_composite_scoring) {
+            // A2: Composite scoring - combine recency and frequency
+            // score = freq_count / age, where age = current - last_used + 1
+            // Lower score = more likely to evict
+            double min_score = (double)cache->freq_count[0] / (double)(cache->access_counter - cache->last_used[0] + 1);
+            for (int i = 1; i < cache->num_entries; i++) {
+                double score = (double)cache->freq_count[i] / (double)(cache->access_counter - cache->last_used[i] + 1);
+                if (score < min_score) {
+                    min_score = score;
+                    target = i;
+                }
+            }
+        } else {
+            // Pure LRU: evict entry with smallest last_used
+            uint64_t min_used = cache->last_used[0];
+            for (int i = 1; i < cache->num_entries; i++) {
+                if (cache->last_used[i] < min_used) {
+                    min_used = cache->last_used[i];
+                    target = i;
+                }
             }
         }
         cache_telemetry_evict(cache->layer_idx[target], cache->expert_idx[target]);
@@ -4556,6 +4577,7 @@ static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, in
     cache->layer_idx[target] = layer;
     cache->expert_idx[target] = expert;
     cache->last_used[target] = ++cache->access_counter;
+    cache->freq_count[target] = 1;  // A2: reset frequency for new entry
     cache->entry_idx[(layer) * cfg.num_experts + (expert)] = target;
     if (out_idx) *out_idx = target;
     return cache->metal_bufs[target];
@@ -4576,6 +4598,8 @@ static void malloc_cache_free(MallocExpertCache *cache) {
     free(cache->layer_idx);
     free(cache->expert_idx);
     free(cache->last_used);
+    free(cache->freq_count);  // A2
+    free(cache->entry_idx);
     free(cache);
 }
 
@@ -8102,6 +8126,7 @@ static void print_usage(const char *prog) {
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cache-mb N         Expert cache budget in MB (converts to entries automatically)\n");
+    printf("  --cache-composite    A2: Use composite eviction (LRU + frequency) instead of pure LRU\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -8187,6 +8212,7 @@ int main(int argc, char **argv) {
             {"trace",         required_argument, 0, 275},
             {"prefill-k",     required_argument, 0, 276},
             {"cache-mb",      required_argument, 0, 277},
+            {"cache-composite", no_argument,     0, 278},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8318,6 +8344,11 @@ int main(int argc, char **argv) {
                 case 277:
                     // --cache-mb N: expert cache size in MB (D1: memory budgeting)
                     cache_mb = atoi(optarg);
+                    break;
+                case 278:
+                    // --cache-composite: A2 composite scoring (LRU + frequency)
+                    g_cache_composite_scoring = 1;
+                    printf("[config] Cache composite scoring enabled (LRU + frequency)\n");
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
