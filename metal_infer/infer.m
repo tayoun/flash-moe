@@ -8101,6 +8101,7 @@ static void print_usage(const char *prog) {
     printf("  --k N                Active experts per layer (default: from config num_experts_per_tok)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
+    printf("  --cache-mb N         Expert cache budget in MB (converts to entries automatically)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -8138,6 +8139,7 @@ int main(int argc, char **argv) {
         int K = -1;  // -1 = use config's num_experts_per_tok
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
+        int cache_mb = 0;  // 0 = disabled, >0 = expert cache size in MB (D1: memory budgeting)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
@@ -8184,6 +8186,7 @@ int main(int argc, char **argv) {
             {"kv-compression", required_argument, 0, 274},
             {"trace",         required_argument, 0, 275},
             {"prefill-k",     required_argument, 0, 276},
+            {"cache-mb",      required_argument, 0, 277},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8312,6 +8315,10 @@ int main(int argc, char **argv) {
                     g_prefill_k = atoi(optarg);
                     printf("[config] Prefill K=%d (decode uses default K)\n", g_prefill_k);
                     break;
+                case 277:
+                    // --cache-mb N: expert cache size in MB (D1: memory budgeting)
+                    cache_mb = atoi(optarg);
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8327,6 +8334,14 @@ int main(int argc, char **argv) {
         if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+
+        // D1: Convert --cache-mb to entries (overrides --malloc-cache if both specified)
+        if (cache_mb > 0) {
+            size_t esz = g_use_2bit ? cfg.expert_size_2bit : cfg.expert_size_4bit;
+            malloc_cache_entries = (int)((size_t)cache_mb * 1024 * 1024 / esz);
+            printf("[config] Cache budget: %d MB → %d entries (%.1f MB actual)\n",
+                   cache_mb, malloc_cache_entries, (double)malloc_cache_entries * esz / 1e6);
+        }
 
         // Write trace header if trace file enabled
         if (g_trace_file) {
@@ -8548,6 +8563,22 @@ int main(int argc, char **argv) {
         } else {
             printf("Cache:    %d entries%s\n", cache_entries,
                    cache_entries > 0 ? "" : " (disabled)");
+        }
+
+        // D1: Memory budget summary
+        {
+            double expert_cache_mb = g_malloc_cache ? (double)malloc_cache_entries * active_expert_size() / 1e6 : 0;
+            double kv_cache_mb = (double)cfg.num_full_attn_layers * 2 * GPU_KV_SEQ * cfg.num_kv_heads * cfg.head_dim * sizeof(float) / 1e6;
+            if (g_kv_compression) kv_cache_mb *= 0.22;  // TurboQuant ~4.6x compression
+            double delta_state_mb = (double)cfg.num_linear_layers * cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float) / 1e6;
+            double total_mb = expert_cache_mb + kv_cache_mb + delta_state_mb;
+            printf("\n--- Memory Budget (D1) ---\n");
+            printf("  Expert cache:   %.0f MB (%d entries)\n", expert_cache_mb, malloc_cache_entries);
+            printf("  KV cache:       %.0f MB (%d full-attn layers × %d seq%s)\n",
+                   kv_cache_mb, cfg.num_full_attn_layers, GPU_KV_SEQ, g_kv_compression ? ", TurboQuant" : "");
+            printf("  Delta-net:      %.0f MB (%d linear layers)\n", delta_state_mb, cfg.num_linear_layers);
+            printf("  Total runtime:  %.0f MB\n", total_mb);
+            printf("--------------------------\n\n");
         }
 
         double t0 = now_ms();
