@@ -4412,6 +4412,14 @@ typedef struct {
 
 static ExpertLRUCache *g_expert_cache = NULL;
 
+// ---- Cache-Prior routing (Cache-Conditional Experts, Skliar et al. 2025) ----
+// Training-free method: boost router logits for experts already in the cache.
+// Adds β × avg_logit_range to cached experts before softmax, making the router
+// prefer cached experts. This exploits MoE's tolerance to routing variations:
+// lower-ranked experts can be swapped with minimal perplexity impact.
+// 50%+ cache miss reduction in their experiments, negligible quality loss.
+static float g_cache_prior_beta = 0.0f;  // fraction of avg logit range to boost (0=disabled)
+
 // Speculative early routing stats
 static uint64_t g_spec_route_attempts = 0;   // total speculative routing attempts
 static uint64_t g_spec_route_hits = 0;        // correctly predicted experts (found in cache at real routing time)
@@ -6357,6 +6365,29 @@ static void fused_layer_forward(
 
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
+
+    // Cache-Prior routing (Skliar et al. 2025): boost cached experts' logits before softmax.
+    // β = fraction of avg_logit_range added to each cached expert's logit.
+    // This is applied to raw logits (pre-softmax) so softmax naturally amplifies the boost.
+    if (g_cache_prior_beta > 0 && g_expert_cache) {
+        // Compute average logit range across all experts
+        float logit_min = gate_scores[0], logit_max = gate_scores[0];
+        for (int ei = 1; ei < cfg.num_experts; ei++) {
+            if (gate_scores[ei] < logit_min) logit_min = gate_scores[ei];
+            if (gate_scores[ei] > logit_max) logit_max = gate_scores[ei];
+        }
+        float avg_range = (logit_max - logit_min) / cfg.num_experts;
+        float boost = g_cache_prior_beta * avg_range;
+
+        // Find which expert indices are cached for this layer
+        int base = layer_idx * cfg.num_experts;
+        for (int ei = 0; ei < cfg.num_experts; ei++) {
+            if (g_expert_cache->entry_idx[base + ei] >= 0) {
+                gate_scores[ei] += boost;
+            }
+        }
+    }
+
     cpu_softmax(gate_scores, cfg.num_experts);
     int expert_indices[64];
     float expert_weights[64];
@@ -8291,6 +8322,7 @@ static void print_usage(const char *prog) {
     printf("  --kv-compression M   KV cache compression: none (default), turbo3 (4.6x)\n");
     printf("  --trace PATH         Dump routing trace for offline cache simulation (simulate.py)\n");
     printf("  --prefill-k N        K used during prefill (0=shared only, establishes TTFT floor)\n");
+    printf("  --cache-prior β      Cache-prior routing: boost cached expert logits by β (0=disabled, 0.5=recommended)\n");
     printf("  --help               This message\n");
 }
 
@@ -8339,6 +8371,7 @@ int main(int argc, char **argv) {
             {"io-threads",    required_argument, 0, 260},
             {"cooccur",       required_argument, 0, 261},
             {"permutation",   required_argument, 0, 262},
+            {"cache-prior",  required_argument, 0, 279},
             {"madvise",       required_argument, 0, 263},
             {"dispatch-io",   no_argument,       0, 264},
             {"car-sample",    required_argument, 0, 265},
@@ -8491,6 +8524,14 @@ int main(int argc, char **argv) {
                     // --cache-composite: A2 composite scoring (LRU + frequency)
                     g_cache_composite_scoring = 1;
                     printf("[config] Cache composite scoring enabled (LRU + frequency)\n");
+                    break;
+                case 279:
+                    // --cache-prior β: boost cached experts' router logits by β × avg_logit_range
+                    // Research: Cache-Conditional Experts (Skliar et al., 2025) — training-free method
+                    // that adds bias to router logits to prefer cached experts.
+                    // Higher β = more cache-friendly routing, at potential quality cost.
+                    g_cache_prior_beta = (float)atof(optarg);
+                    printf("[config] Cache-Prior routing: β=%.3f\n", g_cache_prior_beta);
                     break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
