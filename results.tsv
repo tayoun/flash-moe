@@ -53,3 +53,8 @@ a5-lz4-skip	-	-	-	A5: LZ4 skipped — only 21% of layers compress >1.3x (thresho
 a3-annealing-skip	-	-	-	A3: SA adds +2.9% adjacency vs greedy — preadv coalescing already implemented, marginal benefit
 e1-k6-quality	1.55	19.35	150	E1: K=6 quality validated — factual+logic correct, +17% vs K=8
 e1-k5-quality	1.81	17.47	150	E1: K=5 quality validated — factual+logic correct, +37% vs K=8
+b4-cache-sim-4gb-lru	3.73	-	sim	B4 Exp2: Simulator predicts 4GB LRU cache — 41.7% hit rate, 3.73 tok/s (vs 1.28 baseline)
+b4-cache-sim-6gb-lru	4.19	-	sim	B4 Exp2: Simulator predicts 6GB LRU cache — 49.7% hit rate, 4.19 tok/s (+227%)
+b4-cache-4gb-lru	1.29	4.91	64	B4 Exp2: 4GB malloc cache FIXED — 48.8% hit rate, pread lz4 fields uninitialized (garbage triggered LZ4 path)
+b4-prefetch-skip	-	-	-	B4 Exp3: Co-occurrence prefetch not implemented — temporal --predict exists (25% hit), cooccur data exists
+b4-precision-tiers-skip	-	-	-	B4 Exp4: Per-expert precision tiers not implemented — requires 2-bit cold expert quantization

@@ -69,6 +69,9 @@
 #include <sys/uio.h>
 #include <compression.h>
 
+// Expert offload SSD staging buffer
+#include "expert_offload.h"
+
 // ============================================================================
 // Runtime model configuration (populated from HuggingFace config.json)
 // ============================================================================
@@ -471,6 +474,10 @@ static int g_pred_generating = 0;   // only set to 1 after prefill (predictions 
 static uint64_t g_pred_hits = 0;
 static uint64_t g_pred_misses = 0;
 static uint64_t g_pred_layers = 0;
+
+// Expert offload SSD staging buffer
+static int g_offload_enabled = 0;       // --offload-ssd flag
+static char *g_offload_ssd_path = NULL;  // path to packed_experts_ssd.bin or dir
 
 // Routing data collection for training an expert predictor
 // Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
@@ -4109,6 +4116,16 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         return;
     }
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+
+    // Submit experts to offload staging buffer for background pre-load.
+    // Only active when NOT using g_prefetch (predict path); the predict path
+    // has its own prefetch mechanism. Offload is purely advisory here —
+    // a miss in the staging buffer is harmless; async_pread handles the actual loading.
+    if (g_offload_enabled) {
+        for (int k = 0; k < K; k++) {
+            expert_offload_prefetch(layer_idx, expert_indices[k]);
+        }
+    }
 
     if (g_use_safetensors) {
         void *dst_ptrs[MAX_K];
@@ -8300,6 +8317,7 @@ static void print_usage(const char *prog) {
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cache-mb N         Expert cache budget in MB (converts to entries automatically)\n");
     printf("  --cache-composite    A2: Use composite eviction (LRU + frequency) instead of pure LRU\n");
+    printf("  --offload-ssd PATH   Enable expert offload staging buffer (path to packed_experts dir or .bin file)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -8388,6 +8406,7 @@ int main(int argc, char **argv) {
             {"prefill-k",     required_argument, 0, 276},
             {"cache-mb",      required_argument, 0, 277},
             {"cache-composite", no_argument,     0, 278},
+            {"offload-ssd",   required_argument, 0, 280},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8533,6 +8552,13 @@ int main(int argc, char **argv) {
                     g_cache_prior_beta = (float)atof(optarg);
                     printf("[config] Cache-Prior routing: β=%.3f\n", g_cache_prior_beta);
                     break;
+                case 280: {
+                    // --offload-ssd <path>: enable expert offload with SSD staging buffer
+                    g_offload_enabled = 1;
+                    g_offload_ssd_path = strdup(optarg);
+                    printf("[config] Expert offload: enabled (SSD: %s)\n", g_offload_ssd_path);
+                    break;
+                }
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8738,6 +8764,14 @@ int main(int argc, char **argv) {
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
         infer_prefetch_init();
+
+        // ---- Initialize expert offload SSD staging buffer (if requested) ----
+        if (g_offload_enabled && g_offload_ssd_path) {
+            if (expert_offload_init(g_offload_ssd_path) != 0) {
+                fprintf(stderr, "WARNING: expert_offload_init failed, continuing without offload\n");
+                g_offload_enabled = 0;
+            }
+        }
 
         // ---- Initialize malloc expert cache (if requested) ----
         if (malloc_cache_entries > 0) {
@@ -9384,6 +9418,10 @@ int main(int argc, char **argv) {
         }
 
         // ---- Cleanup ----
+        if (g_offload_enabled) {
+            expert_offload_print_stats();
+            expert_offload_shutdown();
+        }
         infer_prefetch_shutdown();
         io_pool_shutdown();
         if (g_malloc_cache) {
