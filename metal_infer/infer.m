@@ -4019,7 +4019,7 @@ static void *io_pool_worker(void *arg) {
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == g_num_io_threads)
+        if (g_io_pool.tasks_completed == g_io_pool.num_tasks)
             pthread_cond_signal(&g_io_pool.work_done);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -4049,7 +4049,7 @@ static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < g_num_io_threads) {
+    while (g_io_pool.tasks_completed < num_tasks) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
@@ -4072,11 +4072,13 @@ typedef struct {
     InferPreadTask tasks[MAX_K * NUM_EXPERT_COMPONENTS];  // enlarged for safetensors (9 per expert)
     int num_tasks;
     int num_experts;  // K (for validation)
-    int valid[MAX_K];
+    int generation;   // incremented each dispatch; workers tag entries with this
+    struct { int gen; int done; } entries[MAX_K];  // per-slot: gen+done [num_valid]
     dispatch_group_t group;
-    int active;
+    int active;  // counter: number of pending dispatches (not a bool)
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
+static void async_pread_wait(void);  // forward declaration (defined later)
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
@@ -4084,7 +4086,24 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     (void)mmap_base;
     size_t esz = active_expert_size();
     g_async_pread.num_experts = K;
-    g_async_pread.active = 1;
+    // Serialize dispatches within a token: if a previous dispatch is still pending
+    // (active > 0), wait for it to complete before starting a new one.
+    // This ensures entries[] slots and dispatch_group are never shared by concurrent dispatches.
+    if (g_async_pread.active > 0) {
+        async_pread_wait();
+    }
+    g_async_pread.active = 1;  // exactly 1 pending dispatch
+    g_async_pread.generation++;  // unique id for this dispatch's validation
+    int gen = g_async_pread.generation;
+    // Only reset entries if this is a FRESH dispatch (not concurrent with a pending one).
+    // If entries are already tagged with THIS generation, they belong to a previous
+    // layer's dispatch that we haven't waited on yet — don't overwrite.
+    for (int k = 0; k < K; k++) {
+        if (g_async_pread.entries[k].gen != gen) {
+            g_async_pread.entries[k].gen = gen;
+            g_async_pread.entries[k].done = 0;
+        }
+    }
     if (g_prefetch) {
         infer_prefetch_start(g_prefetch, packed_fd, expert_indices, K, dst_bufs, layer_idx);
         return;
@@ -4246,21 +4265,28 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
+    // Note: dispatch_group_wait waits for ALL workers (all dispatches share one group).
+    // Because async_pread_start serializes dispatches (waits for previous before starting new),
+    // there is at most 1 pending dispatch when we reach here.
+    int valid_tmp[MAX_K] = {0};
     if (g_prefetch) {
-        infer_prefetch_wait(g_prefetch, g_async_pread.valid, g_async_pread.num_experts);
-        g_async_pread.active = 0;
-        return;
-    }
-    dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
-    if (g_use_safetensors) {
-        check_safetensor_tasks(g_async_pread.tasks, g_async_pread.num_experts,
-                               g_async_pread.valid);
+        infer_prefetch_wait(g_prefetch, valid_tmp, g_async_pread.num_experts);
     } else {
-        for (int k = 0; k < g_async_pread.num_experts; k++) {
-            g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+        dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+        if (g_use_safetensors) {
+            check_safetensor_tasks(g_async_pread.tasks, g_async_pread.num_experts, valid_tmp);
+        } else {
+            for (int k = 0; k < g_async_pread.num_experts; k++) {
+                valid_tmp[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+            }
         }
     }
     g_async_pread.active = 0;
+    int waited_gen = g_async_pread.generation;
+    for (int k = 0; k < g_async_pread.num_experts; k++) {
+        g_async_pread.entries[k].gen = waited_gen;
+        g_async_pread.entries[k].done = valid_tmp[k];
+    }
 }
 
 static void io_pool_shutdown(void) {
@@ -6660,22 +6686,19 @@ static void fused_layer_forward(
             }
         } else if (pred_started) {
             // ---- Prediction path: predicted experts already loading into buf_B ----
-            // Wait for predicted preads (they've had ~1.6ms: CMD1_wait + attn + CMD2 + routing)
-            async_pread_wait();
-            g_pred_layers++;
-
-            // Match predictions against actual routing
-            int miss_ei[MAX_K];       // actual expert indices for misses
-            int miss_k_slots[MAX_K];  // which k-slot each miss maps to
+            int miss_ei[MAX_K];
+            int miss_k_slots[MAX_K];
             int miss_count = 0;
             int hit_count = 0;
-
+            async_pread_wait();
+            g_pred_layers++;
+            // Match predictions against actual routing
             for (int k = 0; k < actual_K; k++) {
                 int found = 0;
                 for (int p = 0; p < PRED_COUNT(layer_idx); p++) {
                     if (expert_indices[k] == PRED_EXPERT(layer_idx, p) &&
-                        g_async_pread.valid[p]) {
-                        // Hit! This expert was pre-loaded into buf_B[p]
+                        g_async_pread.entries[p].done &&
+                        g_async_pread.entries[p].gen == g_async_pread.generation) {
                         expert_bufs[k] = g_metal->buf_multi_expert_data_B[p];
                         valid[k] = 1;
                         found = 1;
@@ -6692,9 +6715,13 @@ static void fused_layer_forward(
             }
             g_pred_hits += hit_count;
             g_pred_misses += miss_count;
+            // CRASHTEST: marker after prediction matching
 
             // Parallel sync-pread misses into buf_A
             if (miss_count > 0) {
+                // Workers stride by g_num_io_threads; if miss_count < g_num_io_threads,
+                // we must pad num_tasks to avoid out-of-bounds worker access.
+                int ndispatch = (miss_count >= g_num_io_threads) ? miss_count : g_num_io_threads;
                 InferPreadTask tasks[MAX_K];
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
@@ -6705,11 +6732,27 @@ static void fused_layer_forward(
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                 }
-                io_pool_dispatch(tasks, miss_count);
+                // Pad so all workers have valid task indices
+                for (int m = miss_count; m < ndispatch; m++) {
+                    tasks[m].fd = -1;  // invalid fd — harmless
+                    tasks[m].dst = NULL;
+                    tasks[m].offset = 0;
+                    tasks[m].size = 0;
+                    tasks[m].result = 0;
+                }
+                // DEBUG: checkpoint before dispatch
+                fprintf(stderr, "[pred] L%d: pre-dispatch miss_cnt=%d ndispatch=%d\n", layer_idx, miss_count, ndispatch);
+                io_pool_dispatch(tasks, ndispatch);
+                fprintf(stderr, "[pred] L%d: post-dispatch\n", layer_idx);
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
-                    valid[k] = (tasks[m].result == (ssize_t)active_expert_size());
+                    ssize_t res = tasks[m].result;
+                    fprintf(stderr, "[pred] L%d: task[%d] ei=%d k=%d fd=%d offs=%zu sz=%zu result=%zd\n",
+                            layer_idx, m, miss_ei[m], k, tasks[m].fd, tasks[m].offset, tasks[m].size, res);
+                    valid[k] = (res == (ssize_t)active_expert_size());
                 }
+                fprintf(stderr, "[pred] L%d: post-miss-valid\n", layer_idx);
+            } else {
             }
         } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
             // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
@@ -6752,7 +6795,7 @@ static void fused_layer_forward(
         if (!pred_started && g_async_pread.active) {
             async_pread_wait();
             for (int k = 0; k < actual_K; k++) {
-                valid[k] = g_async_pread.valid[k];
+                valid[k] = g_async_pread.entries[k].done;
             }
         }
 
@@ -8044,6 +8087,8 @@ static void serve_loop(
                                             : cpu_argmax(logits, cfg.vocab_size);
 
             // ---- Auto-regressive generation with SSE streaming ----
+            // NOTE: Must be before the generation loop (not inside it), since the loop
+            // may break early on EOS/think-end before the first iteration completes.
             if (g_pred_enabled) {
                 g_pred_generating = 1;
                 g_pred_valid = 0;
@@ -8097,7 +8142,7 @@ static void serve_loop(
                 if (next_token == cfg.think_end_token) in_think = 0;
                 if (in_think) {
                     think_tokens++;
-                    if (g_think_budget > 0 && think_tokens >= g_think_budget) {
+                    if (g_think_budget >= 0 && think_tokens >= g_think_budget) {
                         next_token = cfg.think_end_token;
                         in_think = 0;
                     }
@@ -8186,6 +8231,21 @@ static void serve_loop(
             free(pt);
             free(reqbuf);
             close(client_fd);
+
+            // Reset prediction state — each new request must start fresh.
+            // g_pred_generating and g_pred_valid carry over from the previous
+            // generation loop and would cause prediction to fire during prefill
+            // of subsequent requests (prefill expects pred_valid=0, pred_generating=0).
+            g_pred_generating = 0;
+            g_pred_valid = 0;
+            g_pred_layers = 0;
+            g_pred_hits = 0;
+            g_pred_misses = 0;
+            // Also drain any pending async pread state
+            if (g_async_pread.active > 0) {
+                async_pread_wait();
+            }
+
             continue;
         }
 
@@ -9192,7 +9252,7 @@ int main(int argc, char **argv) {
                                         : cpu_argmax(logits, cfg.vocab_size);
 
             // Think budget: force end thinking if over budget
-            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
+            if (in_think && g_think_budget >= 0 && think_tokens >= g_think_budget) {
                 next_token = cfg.think_end_token;
                 in_think = 0;
             }
