@@ -6658,29 +6658,19 @@ static void fused_layer_forward(
                 }
             }
 
-            // Phase 2: parallel pread all cache misses
+            // Phase 2: pread all cache misses (synchronous to avoid threading issues with Metal buffers)
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
-                    tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
-                    tasks[m].dst = [miss_bufs[m] contents];
-                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
-                    tasks[m].size = esz;
-                    tasks[m].result = 0;
-                    tasks[m].mmap_base = mmap_base;
-                }
-
-                io_pool_dispatch(tasks, num_misses);
-
-                // Mark successfully loaded misses as valid
-                for (int m = 0; m < num_misses; m++) {
-                    int k = miss_indices[m];
-                    valid[k] = (tasks[m].result == (ssize_t)esz);
+                    int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                    void *dst = [miss_bufs[m] contents];
+                    off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
+                    ssize_t r = pread(fd, dst, esz, offset);
+                    valid[k] = (r == (ssize_t)esz);
                     if (!valid[k]) {
                         fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                                expert_indices[k], r, esz);
                     }
                 }
             }
