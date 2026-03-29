@@ -4046,10 +4046,19 @@ static void *io_pool_worker(void *arg) {
                         NULL, COMPRESSION_LZ4);
                     t->result = (ssize_t)dec;
                 } else {
+                    int err = errno;
+                    fprintf(stderr, "[io_pool WORKER ERROR] pread fd=%d offset=%lld size=%zu ret=%zd errno=%d (%s)\n",
+                            t->fd, (long long)t->offset, t->size, nr, err, strerror(err));
                     t->result = -1;
                 }
             } else {
-                t->result = pread(t->fd, t->dst, t->size, t->offset);
+                ssize_t pr = pread(t->fd, t->dst, t->size, t->offset);
+                if (pr < 0) {
+                    int err = errno;
+                    fprintf(stderr, "[io_pool WORKER ERROR] pread fd=%d offset=%lld size=%zu ret=%zd errno=%d (%s)\n",
+                            t->fd, (long long)t->offset, t->size, pr, err, strerror(err));
+                }
+                t->result = pr;
             }
         }
 
@@ -6773,30 +6782,29 @@ static void fused_layer_forward(
                 }
             }
 
-            // Phase 2: parallel pread misses directly into cache buffers (zero-copy)
+            // Phase 2: synchronous pread misses into cache buffers (zero-copy)
+            // NOTE: io_pool_dispatch was too risky with async spec_routing path that can
+            // evict cache entries concurrently. Using synchronous pread like expert_cache.
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
-                    tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
-                    tasks[m].dst = g_malloc_cache->data[cidx];
-                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
-                    tasks[m].size = esz;
-                    tasks[m].result = 0;
-                    tasks[m].mmap_base = NULL;  // always pread for cache population
-                }
-
-                io_pool_dispatch(tasks, num_misses);
-
-                // Mark valid
-                for (int m = 0; m < num_misses; m++) {
-                    int k = miss_indices[m];
-                    valid[k] = (tasks[m].result == (ssize_t)esz);
+                    if (cidx < 0 || cidx >= (int)g_malloc_cache->num_entries) {
+                        valid[k] = 0;
+                        fprintf(stderr, "WARNING: expert %d malloc_cache cidx=%d invalid\n",
+                                expert_indices[k], cidx);
+                        continue;
+                    }
+                    int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                    off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
+                    void *dst = g_malloc_cache->data[cidx];
+                    ssize_t r = pread(fd, dst, esz, offset);
+                    valid[k] = (r == (ssize_t)esz);
                     if (!valid[k]) {
-                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (fd=%d offset=%lld errno=%d/%s)\n",
+                                expert_indices[k], r, esz,
+                                fd, (long long)offset, errno, strerror(errno));
                     }
                 }
             }
@@ -7200,9 +7208,10 @@ static void fused_layer_forward(
         float *expert_out_cpu = malloc(cfg.hidden_dim * sizeof(float));
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            int cpu_fd = g_packed_ssd_mode ? g_packed_ssd_fd : packed_fd;
+            off_t expert_offset = expert_file_offset(layer_idx, eidx, esz);
             void *expert_data = malloc(esz);
-            ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+            ssize_t nread = pread(cpu_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
                 fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                         layer_idx, eidx, nread, esz);
