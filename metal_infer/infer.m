@@ -3774,12 +3774,13 @@ static void moe_forward(
         size_t esz = active_expert_size();
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            off_t expert_offset = expert_file_offset(layer_idx, eidx, esz);
 
             if (g_metal && g_metal->buf_expert_data) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
                 void *expert_buf_ptr = [g_metal->buf_expert_data contents];
-                ssize_t nread = pread(packed_fd, expert_buf_ptr, esz, expert_offset);
+                int efd = expert_pick_fd(layer_idx, eidx, packed_fd);
+                ssize_t nread = pread(efd, expert_buf_ptr, esz, expert_offset);
                 if (nread != (ssize_t)esz) {
                     fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                             layer_idx, eidx, nread, esz);
@@ -3790,7 +3791,8 @@ static void moe_forward(
             } else {
                 // CPU fallback
                 void *expert_data = malloc(esz);
-                ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+                int efd = expert_pick_fd(layer_idx, eidx, packed_fd);
+                ssize_t nread = pread(efd, expert_data, esz, expert_offset);
                 if (nread != (ssize_t)esz) {
                     fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                             layer_idx, eidx, nread, esz);
@@ -5739,9 +5741,9 @@ static void fused_layer_forward(
                     int cidx = -1;
                     id<MTLBuffer> buf = malloc_cache_insert(g_malloc_cache, layer_idx, eidx, &cidx);
                     if (buf && cidx >= 0) {
-                        int fd_copy = packed_fd;
+                        int fd_copy = expert_pick_fd(layer_idx, eidx, packed_fd);
                         void *dst = g_malloc_cache->data[cidx];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        off_t offset = expert_file_offset(layer_idx, eidx, spec_esz);
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -5759,9 +5761,9 @@ static void fused_layer_forward(
                 if (!cached) {
                     id<MTLBuffer> buf = expert_cache_insert(g_expert_cache, layer_idx, eidx);
                     if (buf) {
-                        int fd_copy = packed_fd;
+                        int fd_copy = expert_pick_fd(layer_idx, eidx, packed_fd);
                         void *dst = [buf contents];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        off_t offset = expert_file_offset(layer_idx, eidx, spec_esz);
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -6500,11 +6502,12 @@ static void fused_layer_forward(
                             if (!g_phase_prefetch_q) g_phase_prefetch_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
                             static dispatch_group_t g_phase_prefetch_group = NULL;
                             if (!g_phase_prefetch_group) g_phase_prefetch_group = dispatch_group_create();
-                            off_t off = (off_t)eidx * esz;
+                            off_t off = expert_file_offset(next_layer, eidx, esz);
+                            int pf_fd = expert_pick_fd(next_layer, eidx, packed_fd);
                             void *dst = [(buf) contents];
                             dispatch_group_enter(g_phase_prefetch_group);
                             dispatch_async(g_phase_prefetch_q, ^{
-                                pread(next_fd, dst, esz, off);
+                                pread(pf_fd, dst, esz, off);
                                 dispatch_group_leave(g_phase_prefetch_group);
                             });
                         }
@@ -6886,42 +6889,30 @@ static void fused_layer_forward(
             g_pred_misses += miss_count;
             // CRASHTEST: marker after prediction matching
 
-            // Parallel sync-pread misses into buf_A
+            // Parallel pread misses into buf_A via GCD async (overlaps with GPU work)
             if (miss_count > 0) {
-                // Workers stride by g_num_io_threads; if miss_count < g_num_io_threads,
-                // we must pad num_tasks to avoid out-of-bounds worker access.
-                int ndispatch = (miss_count >= g_num_io_threads) ? miss_count : g_num_io_threads;
-                InferPreadTask tasks[MAX_K];
                 size_t esz = active_expert_size();
+                dispatch_group_t miss_group = dispatch_group_create();
+                static dispatch_queue_t miss_q = NULL;
+                if (!miss_q) miss_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+                // Use a small struct to capture results per-miss
+                static ssize_t miss_results[MAX_K];
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
-                    tasks[m].fd = expert_pick_fd(layer_idx, miss_ei[m], packed_fd);
-                    tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
-                    tasks[m].offset = expert_file_offset(layer_idx, miss_ei[m], esz);
-                    tasks[m].size = esz;
-                    tasks[m].result = 0;
+                    int fd = expert_pick_fd(layer_idx, miss_ei[m], packed_fd);
+                    void *dst = [g_metal->buf_multi_expert_data[k] contents];
+                    off_t offset = expert_file_offset(layer_idx, miss_ei[m], esz);
+                    size_t sz = esz;
+                    ssize_t *result_ptr = &miss_results[m];
+                    dispatch_group_async(miss_group, miss_q, ^{
+                        *result_ptr = pread(fd, dst, sz, offset);
+                    });
                 }
-                // Pad so all workers have valid task indices
-                for (int m = miss_count; m < ndispatch; m++) {
-                    tasks[m].fd = -1;  // invalid fd — harmless
-                    tasks[m].dst = NULL;
-                    tasks[m].offset = 0;
-                    tasks[m].size = 0;
-                    tasks[m].result = 0;
-                }
-                // DEBUG: checkpoint before dispatch
-                fprintf(stderr, "[pred] L%d: pre-dispatch miss_cnt=%d ndispatch=%d\n", layer_idx, miss_count, ndispatch);
-                io_pool_dispatch(tasks, ndispatch);
-                fprintf(stderr, "[pred] L%d: post-dispatch\n", layer_idx);
+                dispatch_group_wait(miss_group, DISPATCH_TIME_FOREVER);
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
-                    ssize_t res = tasks[m].result;
-                    fprintf(stderr, "[pred] L%d: task[%d] ei=%d k=%d fd=%d offs=%zu sz=%zu result=%zd\n",
-                            layer_idx, m, miss_ei[m], k, tasks[m].fd, tasks[m].offset, tasks[m].size, res);
-                    valid[k] = (res == (ssize_t)active_expert_size());
+                    valid[k] = (miss_results[m] == (ssize_t)esz);
                 }
-                fprintf(stderr, "[pred] L%d: post-miss-valid\n", layer_idx);
-            } else {
             }
         } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
             // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
@@ -7152,7 +7143,7 @@ static void fused_layer_forward(
                 int bf_layer = g_car_backfill_queue[i].layer;
                 int bf_expert = g_car_backfill_queue[i].expert_id;
                 int bf_fd = expert_pick_fd(bf_layer, bf_expert, packed_fd);
-                off_t bf_offset = (off_t)bf_expert * esz;
+                off_t bf_offset = expert_file_offset(bf_layer, bf_expert, esz);
                 // Fire-and-forget async pread to warm page cache (data discarded)
                 dispatch_async(backfill_q, ^{
                     // Read into a small stack buffer in chunks to avoid large alloc.

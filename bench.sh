@@ -5,8 +5,11 @@
 #   MODEL_DIR=/path/to/model ./bench.sh
 #   MODEL_DIR=/path/to/model EXTRA_ARGS="--car-threshold 0.35" ./bench.sh
 #
-# Prints a single RESULT line:
+# Prints:
+#   MEMORY: rss_mb=<...> sys_free_mb=<...>
 #   RESULT: tok_s=<...> ttft_s=<...> crashes=<...> quality=<...> tokens=<...>
+#
+# Memory tracked via `ps` for server RSS and `vm_stat` for system free pages.
 
 set -euo pipefail
 
@@ -19,6 +22,7 @@ if [[ "${MODEL_DIR}" == *122B* || "${MODEL_DIR}" == *122b* ]]; then
     WEIGHTS="${WEIGHTS:-${REPO_DIR}/metal_infer/out_122b/model_weights.bin}"
     MANIFEST="${MANIFEST:-${REPO_DIR}/metal_infer/out_122b/model_weights.json}"
     VOCAB="${VOCAB:-${REPO_DIR}/metal_infer/vocab_122b.bin}"
+    SSD_PATH="${SSD_PATH:-${REPO_DIR}/metal_infer/out_122b/packed_experts_ssd.bin}"
     K="${K:-8}"
     STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-120}"
 else
@@ -68,6 +72,7 @@ ${INFER} \
     --manifest "${MANIFEST}" \
     --vocab "${VOCAB}" \
     --k "${K}" \
+    ${SSD_PATH:+--offload-ssd "${SSD_PATH}"} \
     ${EXTRA_ARGS} \
     --serve "${PORT}" >/dev/null 2>&1 &
 SERVER_PID=$!
@@ -90,14 +95,38 @@ if ! curl -s --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; the
     exit 1
 fi
 
-python3 - "${PORT}" "${MAX_TOKENS}" <<'PY'
+python3 - "${PORT}" "${MAX_TOKENS}" "${SERVER_PID}" <<'PY'
 import json
 import sys
 import time
 import urllib.request
+import subprocess
 
 port = int(sys.argv[1])
 max_tokens = int(sys.argv[2])
+server_pid = int(sys.argv[3])
+
+def get_server_rss(pid):
+    try:
+        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "rss="], text=True, timeout=2)
+        return int(out.strip()) / 1024  # KB -> MB
+    except Exception:
+        return 0.0
+
+def get_sys_free_mb():
+    try:
+        out = subprocess.check_output(["vm_stat"], text=True, timeout=3)
+        for line in out.split("\n"):
+            if "Pages free:" in line:
+                parts = line.split()
+                free_pages = int(parts[-1].rstrip("."))
+                return free_pages * 16384 / (1024 * 1024)  # pages -> MB
+    except Exception:
+        pass
+    return 0.0
+
+rss_before = get_server_rss(server_pid)
+free_before = get_sys_free_mb()
 url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
 payload = {
@@ -146,5 +175,9 @@ decode_s = (end - (first_token_at or end))
 tok_s = (tokens / decode_s) if decode_s > 0 else 0.0
 quality = "pass" if tokens >= 32 and len("".join(text_parts).strip()) > 0 else "warn"
 
+rss_after = get_server_rss(server_pid)
+free_after = get_sys_free_mb()
+
+print(f"MEMORY: rss_mb={rss_before:.0f}->{rss_after:.0f} sys_free_mb={free_before:.0f}->{free_after:.0f}")
 print(f"RESULT: tok_s={tok_s:.2f} ttft_s={ttft:.2f} crashes=0 quality={quality} tokens={tokens}")
 PY
