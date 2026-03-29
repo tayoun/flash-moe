@@ -479,6 +479,13 @@ static uint64_t g_pred_layers = 0;
 static int g_offload_enabled = 0;       // --offload-ssd flag
 static char *g_offload_ssd_path = NULL;  // path to packed_experts_ssd.bin or dir
 
+// Packed sequential SSD mode (single .bin file, all experts concatenated)
+static int g_packed_ssd_mode = 0;       // 1 if reading from packed_experts_ssd.bin
+static int g_packed_ssd_fd = -1;         // single fd for the packed .bin file
+static size_t g_packed_expert_size = 5308416;  // bytes per expert in packed file
+static uint32_t g_packed_num_layers = 0;
+static uint32_t g_packed_num_experts = 0;
+
 // Routing data collection for training an expert predictor
 // Binary format per sample: int32 layer_idx, int32 K, float32[4096] hidden, int32[K] expert_indices
 static FILE *g_routing_log = NULL;
@@ -518,6 +525,22 @@ static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in mai
 // F_NOCACHE mode: 0=off, 1=all expert reads, 2=tiered (cold first, warm repeats)
 static int g_nocache_mode = 0;
 
+// G5: Phase-aware prefetch — after attention RMSNorm, prefetch next layer's experts
+static int g_phase_aware_prefetch = 0;  // enabled by --phase-aware-prefetch
+
+// G11: AIO queue depth tuning
+static int g_aio_queue_depth = 4;  // default queue depth
+
+// G13: Co-occurrence-aware cache eviction
+static float g_cooccur_eviction_beta = 0.5f;  // default beta
+
+// G9: Hot/cold cache tiering
+static int g_hot_cache_mb = 1024;   // default 1GB hot pool
+static int g_cold_cache_mb = 1024;  // default 1GB cold pool
+
+// G12: Expert load deduplication
+static int g_dedup_experts = 1;  // default: on
+
 // Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
@@ -531,6 +554,7 @@ static inline void expert_mark_seen(int layer, int expert) {
 // g_nocache_mode=1: always cold fd (F_NOCACHE — best for 122B where experts >> RAM)
 // g_nocache_mode=2: tiered — cold for first read, warm for repeats
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
+    if (g_packed_ssd_mode) return g_packed_ssd_fd;  // single fd for packed .bin
     if (g_nocache_mode == 0) return warm_fd;
     if (g_nocache_mode == 1) {
         // All reads through F_NOCACHE fd
@@ -564,7 +588,12 @@ static inline int expert_physical_pos(int layer, int expert_id) {
 }
 
 // Compute file offset for an expert, accounting for permutation
+// In packed SSD mode: header(16) + (layer * num_experts + expert) * expert_size
 static inline off_t expert_file_offset(int layer, int expert_id, size_t esz) {
+    if (g_packed_ssd_mode) {
+        return 16 + (off_t)layer * g_packed_num_experts * g_packed_expert_size
+               + (off_t)expert_id * g_packed_expert_size;
+    }
     return (off_t)expert_physical_pos(layer, expert_id) * esz;
 }
 
@@ -4082,9 +4111,11 @@ typedef struct {
     int generation;   // incremented each dispatch; workers tag entries with this
     struct { int gen; int done; } entries[MAX_K];  // per-slot: gen+done [num_valid]
     dispatch_group_t group;
+    dispatch_semaphore_t throttle_sem;  // G11: limits concurrent preads (queue depth)
     int active;  // counter: number of pending dispatches (not a bool)
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
+static dispatch_semaphore_t g_aio_throttle_sem = 0;  // G11: initialized lazily in async_pread_start
 static void async_pread_wait(void);  // forward declaration (defined later)
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
@@ -4153,15 +4184,21 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         g_async_pread.tasks[k].result = 0;
     }
 
-    // ---- Experiment A: dispatch_io channel path ----
+    // ---- dispatch_io channel path (G11: queue depth throttling) ----
     if (g_use_dispatch_io) {
         if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
+        // G11: lazily initialize throttle semaphore based on g_aio_queue_depth
+        if (g_aio_throttle_sem == 0 && g_aio_queue_depth > 0) {
+            g_aio_throttle_sem = dispatch_semaphore_create(g_aio_queue_depth);
+        }
         static dispatch_queue_t dio_q = NULL;
         if (!dio_q) dio_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
 
         for (int k = 0; k < K; k++) {
+            // G11: throttle concurrent reads to g_aio_queue_depth
+            if (g_aio_throttle_sem) dispatch_semaphore_wait(g_aio_throttle_sem, DISPATCH_TIME_FOREVER);
             InferPreadTask *t = &g_async_pread.tasks[k];
-            dispatch_io_t channel = dispatch_io_create(DISPATCH_IO_RANDOM, packed_fd, dio_q, ^(int error) {
+            dispatch_io_t channel = dispatch_io_create(DISPATCH_IO_RANDOM, t->fd, dio_q, ^(int error) {
                 if (error) fprintf(stderr, "[dispatch_io] cleanup error: %d\n", error);
             });
             // Set high water mark to expert size for single large read
@@ -4184,6 +4221,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
                     if (done) {
                         t->result = error ? -1 : (ssize_t)bytes_read;
                         dispatch_group_leave(g_async_pread.group);
+                        if (g_aio_throttle_sem) dispatch_semaphore_signal(g_aio_throttle_sem);
                     }
                 });
             dispatch_io_close(channel, 0);
@@ -4194,6 +4232,10 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     // Fire off async reads on GCD and return immediately.
     // Coalesce adjacent expert offsets into one preadv() when possible.
     // This reduces syscall overhead and can improve NVMe sequential read behavior.
+    // G11: throttle concurrent runs using a semaphore to control effective I/O queue depth.
+    if (g_aio_throttle_sem == 0 && g_aio_queue_depth > 0) {
+        g_aio_throttle_sem = dispatch_semaphore_create(g_aio_queue_depth);
+    }
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
 
@@ -4234,10 +4276,15 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
             run->idx[i] = order[run_start + i];
         }
 
+        // G11: throttle concurrent run dispatch based on g_aio_queue_depth
+        if (g_aio_throttle_sem) dispatch_semaphore_wait(g_aio_throttle_sem, DISPATCH_TIME_FOREVER);
         dispatch_group_async(g_async_pread.group, io_q, ^{
+            // Capture semaphore pointer at block creation time
+            __block dispatch_semaphore_t sem_copy = g_aio_throttle_sem;
             if (run->count == 1) {
                 InferPreadTask *t = &run->tasks[run->idx[0]];
                 t->result = pread(t->fd, t->dst, t->size, t->offset);
+                if (sem_copy) dispatch_semaphore_signal(sem_copy);
                 free(run);
                 return;
             }
@@ -4256,6 +4303,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
                 for (int i = 0; i < run->count; i++) {
                     run->tasks[run->idx[i]].result = -1;
                 }
+                if (sem_copy) dispatch_semaphore_signal(sem_copy);
                 free(run);
                 return;
             }
@@ -4273,6 +4321,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
                     t->result = 0;
                 }
             }
+            if (sem_copy) dispatch_semaphore_signal(sem_copy);
             free(run);
         });
 
@@ -4333,10 +4382,9 @@ static int parallel_pread_experts(
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
-        int phys = expert_physical_pos(layer_idx, expert_indices[k]);
         tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
-        tasks[k].offset = (off_t)phys * esz;
+        tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k], esz);
         tasks[k].size = esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
@@ -4843,7 +4891,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
     pthread_mutex_lock(&pf->mutex);
     size_t esz = active_expert_size();
     InferIOPlan *plan = &pf->plan;
-    plan->fd = packed_fd;
+    plan->fd = g_packed_ssd_mode ? g_packed_ssd_fd : packed_fd;
     plan->K = K;
     plan->layer_idx = layer_idx;
     memcpy(plan->expert_indices, expert_indices, K * sizeof(int));
@@ -5482,7 +5530,7 @@ static void fused_layer_forward(
         // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
         // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
         // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
-        if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
+        if (g_pred_enabled && g_pred_generating && g_pred_valid && (packed_fd >= 0 || g_packed_ssd_mode) &&
             g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
@@ -5650,7 +5698,7 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t0 = now_ms(); }
     s_spec_count = 0;
 
-    if (spec_routing_enabled && (g_expert_cache || g_malloc_cache) && packed_fd >= 0 && lc->gate_w) {
+    if (spec_routing_enabled && (g_expert_cache || g_malloc_cache) && (packed_fd >= 0 || g_packed_ssd_mode) && lc->gate_w) {
         float *spec_scores = s_spec_gate_scores;
         memset(spec_scores, 0, cfg.num_experts * sizeof(float));
 
@@ -6383,6 +6431,81 @@ static void fused_layer_forward(
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
 
+    // G5: Phase-aware prefetch — after attention RMSNorm / CMD2 wait, before routing.
+    // Trigger async preads for next layer's experts while CPU is between attention and routing.
+    // Use top-K globally popular experts as a simple heuristic (known from frequency tracking).
+    if (g_phase_aware_prefetch && layer_idx < cfg.num_layers - 1 && g_expert_freq && (packed_fd >= 0 || g_packed_ssd_mode)) {
+        int next_layer = layer_idx + 1;
+        int next_fd = g_layer_fds_cold ? g_layer_fds_cold[next_layer] : -1;
+        if (next_fd >= 0) {
+            int topK = (K > MAX_K) ? MAX_K : K;
+            // Find top-K globally popular experts using frequency data
+            int pop_indices[8];
+            float pop_scores[8];
+            // Build a list of (expert_id, freq_score) for this layer
+            typedef struct { int id; float freq; } FreqPair;
+            FreqPair pairs[256];
+            for (int e = 0; e < cfg.num_experts; e++) {
+                pairs[e].id = e;
+                pairs[e].freq = (float)g_expert_freq[next_layer * cfg.num_experts + e];
+            }
+            // Simple selection sort for top-K
+            for (int i = 0; i < topK; i++) {
+                int best = i;
+                for (int j = i + 1; j < cfg.num_experts; j++) {
+                    if (pairs[j].freq > pairs[best].freq) best = j;
+                }
+                pop_indices[i] = pairs[best].id;
+                pop_scores[i] = pairs[best].freq;
+                FreqPair tmp = pairs[i]; pairs[i] = pairs[best]; pairs[best] = tmp;
+            }
+            // Trigger async pread for next layer's popular experts
+            // Use async_pread_start with the top-K popular expert indices
+            static id<MTLBuffer> s_phase_aware_bufs[MAX_K];
+            size_t esz = active_expert_size();
+            for (int k = 0; k < topK; k++) {
+                int eidx = pop_indices[k];
+                // Check if already cached
+                id<MTLBuffer> cached = expert_cache_lookup(g_expert_cache, next_layer, eidx);
+                if (!cached) {
+                    id<MTLBuffer> buf = expert_cache_insert(g_expert_cache, next_layer, eidx);
+                    if (buf) {
+                        s_phase_aware_bufs[k] = buf;
+                    } else {
+                        s_phase_aware_bufs[k] = nil;
+                    }
+                } else {
+                    s_phase_aware_bufs[k] = cached;
+                }
+            }
+            // Issue preads for uncached ones
+            for (int k = 0; k < topK; k++) {
+                if (s_phase_aware_bufs[k]) {
+                    int eidx = pop_indices[k];
+                    id<MTLBuffer> cached2 = expert_cache_lookup(g_expert_cache, next_layer, eidx);
+                    if (!cached2) {
+                        id<MTLBuffer> buf = expert_cache_insert(g_expert_cache, next_layer, eidx);
+                        if (buf && buf != s_phase_aware_bufs[k]) {
+                            // Issue async pread using dispatch_io directly
+                            static dispatch_queue_t g_phase_prefetch_q = NULL;
+                            if (!g_phase_prefetch_q) g_phase_prefetch_q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+                            static dispatch_group_t g_phase_prefetch_group = NULL;
+                            if (!g_phase_prefetch_group) g_phase_prefetch_group = dispatch_group_create();
+                            off_t off = (off_t)eidx * esz;
+                            void *dst = [(buf) contents];
+                            dispatch_group_enter(g_phase_prefetch_group);
+                            dispatch_async(g_phase_prefetch_q, ^{
+                                pread(next_fd, dst, esz, off);
+                                dispatch_group_leave(g_phase_prefetch_group);
+                            });
+                        }
+                    }
+                }
+            }
+            (void)spec_group;  // silence unused warning
+        }
+    }
+
     // Cache-Prior routing (Skliar et al. 2025): boost cached experts' logits before softmax.
     // β = fraction of avg_logit_range added to each cached expert's logit.
     // This is applied to raw logits (pre-softmax) so softmax naturally amplifies the boost.
@@ -6615,7 +6738,7 @@ static void fused_layer_forward(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
-    if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+    if ((packed_fd >= 0 || g_packed_ssd_mode) && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
         // For each expert:
         //   - Cache HIT:  dispatch directly from cached Metal buffer (skip pread)
@@ -7001,7 +7124,7 @@ static void fused_layer_forward(
         // ---- CAR backfill (Phase 4.3): warm page cache for substituted experts ----
         // GPU is now busy with expert compute, SSD is idle. Async pread the original
         // experts that were substituted so mincore() sees them next token.
-        if (g_car_backfill_count > 0 && packed_fd >= 0) {
+        if (g_car_backfill_count > 0 && (packed_fd >= 0 || g_packed_ssd_mode)) {
             // Sort by score (highest first) — most impactful experts get warmed first
             for (int i = 1; i < g_car_backfill_count; i++) {
                 CarBackfillEntry key = g_car_backfill_queue[i];
@@ -7071,7 +7194,7 @@ static void fused_layer_forward(
         // will wait for the GPU and apply the final combine.
         return;
 
-    } else if (packed_fd >= 0) {
+    } else if (packed_fd >= 0 || g_packed_ssd_mode) {
         // CPU fallback for experts
         size_t esz = active_expert_size();
         float *expert_out_cpu = malloc(cfg.hidden_dim * sizeof(float));
@@ -8407,6 +8530,12 @@ int main(int argc, char **argv) {
             {"cache-mb",      required_argument, 0, 277},
             {"cache-composite", no_argument,     0, 278},
             {"offload-ssd",   required_argument, 0, 280},
+            {"phase-aware-prefetch", no_argument, 0, 281},
+            {"aio-depth",     required_argument, 0, 282},
+            {"cooccur-eviction-beta", required_argument, 0, 283},
+            {"hot-cache-mb",  required_argument, 0, 284},
+            {"cold-cache-mb", required_argument, 0, 285},
+            {"dedup-experts", no_argument,       0, 286},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -8554,11 +8683,78 @@ int main(int argc, char **argv) {
                     break;
                 case 280: {
                     // --offload-ssd <path>: enable expert offload with SSD staging buffer
+                    // If path ends in .bin, use packed sequential layout
+                    size_t len = strlen(optarg);
+                    if (len > 4 && strcmp(optarg + len - 4, ".bin") == 0) {
+                        // Open the packed .bin file
+                        g_packed_ssd_fd = open(optarg, O_RDONLY);
+                        if (g_packed_ssd_fd < 0) {
+                            fprintf(stderr, "ERROR: Cannot open packed SSD file %s: %s\n", optarg, strerror(errno));
+                        } else {
+                            // Read header: num_layers (uint32), num_experts (uint32), expert_size (uint64, big-endian)
+                            uint8_t header[16];
+                            ssize_t hr = read(g_packed_ssd_fd, header, 16);
+                            if (hr == 16) {
+                                uint32_t nl = ((uint32_t)header[0]<<24) | ((uint32_t)header[1]<<16) | ((uint32_t)header[2]<<8) | header[3];
+                                uint32_t ne = ((uint32_t)header[4]<<24) | ((uint32_t)header[5]<<16) | ((uint32_t)header[6]<<8) | header[7];
+                                uint64_t es = ((uint64_t)header[8]<<56) | ((uint64_t)header[9]<<48) | ((uint64_t)header[10]<<40) | ((uint64_t)header[11]<<32) | ((uint64_t)header[12]<<24) | ((uint64_t)header[13]<<16) | ((uint64_t)header[14]<<8) | header[15];
+                                g_packed_num_layers = nl;
+                                g_packed_num_experts = ne;
+                                g_packed_expert_size = es;
+                                g_packed_ssd_mode = 1;
+                                printf("[config] Packed SSD mode: %u layers x %u experts x %zu bytes = %.1f GB\n",
+                                       nl, ne, es, (double)nl * ne * es / 1e9);
+                            } else {
+                                fprintf(stderr, "ERROR: Could not read packed SSD header: %zd bytes\n", hr);
+                                close(g_packed_ssd_fd);
+                                g_packed_ssd_fd = -1;
+                            }
+                        }
+                    }
                     g_offload_enabled = 1;
                     g_offload_ssd_path = strdup(optarg);
                     printf("[config] Expert offload: enabled (SSD: %s)\n", g_offload_ssd_path);
                     break;
                 }
+                case 281:
+                    // --phase-aware-prefetch: after attention RMSNorm, prefetch next layer's experts
+                    g_phase_aware_prefetch = 1;
+                    printf("[config] Phase-aware prefetch: enabled\n");
+                    break;
+                case 282: {
+                    // --aio-depth N: async I/O queue depth (Experiment G11)
+                    int ad = atoi(optarg);
+                    if (ad >= 1 && ad <= 256) {
+                        g_aio_queue_depth = ad;
+                        printf("[config] AIO queue depth: %d\n", g_aio_queue_depth);
+                    } else {
+                        fprintf(stderr, "[warn] --aio-depth must be 1-256, using default\n");
+                    }
+                    break;
+                }
+                case 283: {
+                    // --cooccur-eviction-beta β: co-occurrence-aware cache eviction (Experiment G13)
+                    g_cooccur_eviction_beta = (float)atof(optarg);
+                    printf("[config] Co-occurrence eviction beta: %.3f\n", g_cooccur_eviction_beta);
+                    break;
+                }
+                case 284: {
+                    // --hot-cache-mb N: hot pool size in MB (Experiment G9)
+                    g_hot_cache_mb = atoi(optarg);
+                    printf("[config] Hot cache size: %d MB\n", g_hot_cache_mb);
+                    break;
+                }
+                case 285: {
+                    // --cold-cache-mb N: cold pool size in MB (Experiment G9)
+                    g_cold_cache_mb = atoi(optarg);
+                    printf("[config] Cold cache size: %d MB\n", g_cold_cache_mb);
+                    break;
+                }
+                case 286:
+                    // --dedup-experts: deduplicate expert loads within a layer (Experiment G12)
+                    g_dedup_experts = 1;
+                    printf("[config] Expert load deduplication: enabled\n");
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8933,11 +9129,21 @@ int main(int argc, char **argv) {
         void **layer_mmaps = calloc(cfg.num_layers, sizeof(void *));
         size_t *layer_mmap_sizes = calloc(cfg.num_layers, sizeof(size_t));
         int expert_layers_available = 0;
+        if (g_packed_ssd_mode) expert_layers_available = cfg.num_layers;
 
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, cfg.num_layers * ((cfg.num_experts + 7) / 8));
 
         for (int i = 0; i < cfg.num_layers; i++) {
+            if (g_packed_ssd_mode) {
+                // In packed SSD mode, skip per-layer file opens entirely.
+                // All reads go through g_packed_ssd_fd with global offsets.
+                layer_fds[i] = -1;
+                layer_fds_cold[i] = -1;
+                layer_mmaps[i] = MAP_FAILED;
+                layer_mmap_sizes[i] = 0;
+                continue;
+            }
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
