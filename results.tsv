@@ -58,3 +58,4 @@ b4-cache-sim-6gb-lru	4.19	-	sim	B4 Exp2: Simulator predicts 6GB LRU cache — 49
 b4-cache-4gb-lru	1.29	4.91	64	B4 Exp2: 4GB malloc cache FIXED — 48.8% hit rate, pread lz4 fields uninitialized (garbage triggered LZ4 path)
 b4-prefetch-skip	-	-	-	B4 Exp3: Co-occurrence prefetch not implemented — temporal --predict exists (25% hit), cooccur data exists
 b4-precision-tiers-skip	-	-	-	B4 Exp4: Per-expert precision tiers not implemented — requires 2-bit cold expert quantization
+g5-phase-aware-prefetch	1.21	16.54	162	G5: phase-aware prefetch — no improvement over baseline (1.21 tok/s)

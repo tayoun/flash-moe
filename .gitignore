@@ -40,7 +40,6 @@ metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
 
 # Internal planning / benchmark artifacts
-program.md
 bench_runner.py
 results.tsv
 metal_infer/results.tsv

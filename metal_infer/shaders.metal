@@ -667,6 +667,108 @@ kernel void dequant_matvec_2bit(
 
 
 // ============================================================================
+// Kernel 1f: 2-bit dequant matvec for Qwen3.5-MoE
+// ============================================================================
+//
+// 2-bit affine quantization for Qwen3.5-MoE expert weights.
+// Format: uint4 vector loads (128-bit), each uint4 = 4 uint32 = 64 2-bit values.
+//
+// Weight layout: [out_dim, packed_cols] where packed_cols = in_dim / 16.
+// Each 2-bit value: q = (packed >> (n*2)) & 0x3, value = q * scale + bias
+// Scale/bias indexed by group: g = col / (group_size / 16), where group_size=64.
+//
+// Expert sub-components:
+//   gate/up:  in_dim=3072, out_dim=1024  →  packed_cols=192, num_groups=48
+//   down:     in_dim=1024, out_dim=3072  →  packed_cols=64,  num_groups=16
+//
+// Uses same ROWS_PER_TG=8, simdgroup reduction, and x_shared[4096] as 4bit_v4.
+
+kernel void dequant_matvec_2bit_qwen(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    // 2-bit: 16 values per uint32, 4 columns per group (group_size/16 = 64/16 = 4)
+    uint packed_cols = in_dim / 16;
+    uint num_groups  = in_dim / group_size;
+    uint group_step  = group_size / 16;  // = 4 for group_size=64
+
+    // Cache input vector
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    // Cast to uint4 for vector loads — each uint4 = 4 uint32 = 64 2-bit values
+    device const uint4* w_row_v = (device const uint4*)(W_packed + row * packed_cols);
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    uint vec4_cols = packed_cols / 4;  // number of uint4 vectors per row
+
+    float acc = 0.0f;
+
+    // Each lane processes vec4_cols / 32 vectors (simdgroup coalesced)
+    for (uint vi = simd_lane; vi < vec4_cols; vi += 32) {
+        uint4 packed4 = w_row_v[vi];
+
+        // Each uint4 covers 4 * 16 = 64 input elements
+        // Starting packed column = vi * 4
+        uint base_col = vi * 4;
+        uint x_base = base_col * 16;  // 16 values per uint32 for 2-bit
+
+        // Process each of the 4 uint32 words in the uint4
+        #pragma unroll
+        for (uint w = 0; w < 4; w++) {
+            uint32_t packed = packed4[w];
+            uint col = base_col + w;
+            uint g = col / group_step;  // group index: col / 4 for group_size=64
+            float scale = bf16_to_f32(s_row[g]);
+            float bias  = bf16_to_f32(b_row[g]);
+
+            uint xb = x_base + w * 16;
+            // 2-bit: extract 16 values (bits 0-1, 2-3, ..., 30-31)
+            acc += (float((packed >>  0) & 0x3) * scale + bias) * x_shared[xb +  0];
+            acc += (float((packed >>  2) & 0x3) * scale + bias) * x_shared[xb +  1];
+            acc += (float((packed >>  4) & 0x3) * scale + bias) * x_shared[xb +  2];
+            acc += (float((packed >>  6) & 0x3) * scale + bias) * x_shared[xb +  3];
+            acc += (float((packed >>  8) & 0x3) * scale + bias) * x_shared[xb +  4];
+            acc += (float((packed >> 10) & 0x3) * scale + bias) * x_shared[xb +  5];
+            acc += (float((packed >> 12) & 0x3) * scale + bias) * x_shared[xb +  6];
+            acc += (float((packed >> 14) & 0x3) * scale + bias) * x_shared[xb +  7];
+            acc += (float((packed >> 16) & 0x3) * scale + bias) * x_shared[xb +  8];
+            acc += (float((packed >> 18) & 0x3) * scale + bias) * x_shared[xb +  9];
+            acc += (float((packed >> 20) & 0x3) * scale + bias) * x_shared[xb + 10];
+            acc += (float((packed >> 22) & 0x3) * scale + bias) * x_shared[xb + 11];
+            acc += (float((packed >> 24) & 0x3) * scale + bias) * x_shared[xb + 12];
+            acc += (float((packed >> 26) & 0x3) * scale + bias) * x_shared[xb + 13];
+            acc += (float((packed >> 28) & 0x3) * scale + bias) * x_shared[xb + 14];
+            acc += (float((packed >> 30) & 0x3) * scale + bias) * x_shared[xb + 15];
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads
 // ============================================================================
 //

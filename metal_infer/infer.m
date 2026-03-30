@@ -1856,7 +1856,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3_tg128 = makePipe(@"dequant_matvec_4bit_v3_tg128");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit_qwen");  // Fixed for Qwen3.5-MoE
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
