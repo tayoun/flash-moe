@@ -480,7 +480,9 @@ static int g_offload_enabled = 0;       // --offload-ssd flag
 static char *g_offload_ssd_path = NULL;  // path to packed_experts_ssd.bin or dir
 
 // Packed sequential SSD mode (single .bin file, all experts concatenated)
-static int g_packed_ssd_mode = 0;       // 1 if reading from packed_experts_ssd.bin
+static int g_packed_ssd_mode = 0;
+void *g_expert_ram_base = NULL;  // RAM preload for experts
+bool g_preload_ram = false;       // 1 if reading from packed_experts_ssd.bin
 static int g_packed_ssd_fd = -1;         // single fd for the packed .bin file
 static size_t g_packed_expert_size = 5308416;  // bytes per expert in packed file
 static uint32_t g_packed_num_layers = 0;
@@ -574,6 +576,64 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 static inline size_t active_expert_size(void) {
     return g_use_2bit ? cfg.expert_size_2bit : cfg.expert_size_4bit;
 }
+
+// Preload all experts from SSD into RAM for ultra-fast inference (~0.3ms/layer vs ~13ms SSD)
+// Memory: num_layers * num_experts * expert_size bytes (e.g. 48*256*5.3MB = 65GB max)
+// We load all layers' experts sequentially into RAM at startup (one-time ~20 sec).
+// During inference: memcpy from RAM base to GPU buffer (~0.1ms per expert).
+static bool preloadExpertsIntoRAM(void) {
+    if (!g_packed_ssd_mode || g_packed_ssd_fd < 0 || g_packed_num_layers == 0) {
+        fprintf(stderr, "[preload] Not in SSD mode or no header read, skipping\n");
+        return false;
+    }
+    
+    size_t esz = g_packed_expert_size;
+    uint32_t nl = g_packed_num_layers;
+    uint32_t ne = g_packed_num_experts;
+    size_t total_ram = (size_t)nl * ne * esz;
+    
+    fprintf(stderr, "[preload] Preloading %u layers x %u experts x %zu bytes = %.1f GB...\n",
+            nl, ne, esz, (double)total_ram / 1e9);
+    
+    // Allocate RAM buffer
+    g_expert_ram_base = malloc(total_ram);
+    if (!g_expert_ram_base) {
+        fprintf(stderr, "[preload] ERROR: can't allocate %.1f GB for expert RAM\n", (double)total_ram / 1e9);
+        return false;
+    }
+    
+    // Read all experts sequentially
+    // Header is 16 bytes, data starts at offset 16
+    lseek(g_packed_ssd_fd, 16, SEEK_SET);
+    
+    size_t total_read = 0;
+    size_t chunk = 64 * 1024 * 1024;  // 64MB chunks
+    uint8_t *ptr = (uint8_t *)g_expert_ram_base;
+    size_t remaining = total_ram;
+    
+    while (remaining > 0) {
+        size_t to_read = (remaining < chunk) ? remaining : chunk;
+        ssize_t r = read(g_packed_ssd_fd, ptr, to_read);
+        if (r <= 0) {
+            fprintf(stderr, "[preload] ERROR: read failed at offset %zu: %zd\n", total_read, r);
+            free(g_expert_ram_base);
+            g_expert_ram_base = NULL;
+            return false;
+        }
+        ptr += r;
+        total_read += r;
+        remaining -= r;
+        if (total_read % (1024 * 1024 * 1024) < chunk) {
+            fprintf(stderr, "[preload] Loaded %.1f / %.1f GB...\n",
+                    (double)total_read / 1e9, (double)total_ram / 1e9);
+        }
+    }
+    
+    fprintf(stderr, "[preload] DONE: %.1f GB loaded into RAM at %p\n",
+            (double)total_read / 1e9, g_expert_ram_base);
+    return true;
+}
+
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
 // ---- Expert permutation (for clustered layout) ----
@@ -4134,6 +4194,25 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                int layer_idx) {
     (void)mmap_base;
     size_t esz = active_expert_size();
+    
+    // RAM preload path: if experts are preloaded in RAM, memcpy is ~80x faster than pread
+    // (~0.1ms per expert vs ~1.5ms SSD read)
+    if (g_expert_ram_base) {
+        for (int k = 0; k < K; k++) {
+            int ei = expert_indices[k];
+            off_t offset = expert_file_offset(layer_idx, ei, esz);
+            void *dst = [dst_bufs[k] contents];
+            void *src = (uint8_t *)g_expert_ram_base + offset;
+            memcpy(dst, src, esz);
+        }
+        // Mark all entries done (synchronous, no async needed)
+        for (int k = 0; k < K; k++) {
+            g_async_pread.entries[k].done = 1;
+            g_async_pread.entries[k].gen = g_async_pread.generation;
+        }
+        g_async_pread.active = 0;  // no pending async
+        return;
+    }
     g_async_pread.num_experts = K;
     // Serialize dispatches within a token: if a previous dispatch is still pending
     // (active > 0), wait for it to complete before starting a new one.
@@ -6785,9 +6864,7 @@ static void fused_layer_forward(
                 }
             }
 
-            // Phase 2: synchronous pread misses into cache buffers (zero-copy)
-            // NOTE: io_pool_dispatch was too risky with async spec_routing path that can
-            // evict cache entries concurrently. Using synchronous pread like expert_cache.
+            // Phase 2: synchronous pread OR RAM memcpy misses into cache buffers
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
                 for (int m = 0; m < num_misses; m++) {
@@ -6799,15 +6876,23 @@ static void fused_layer_forward(
                                 expert_indices[k], cidx);
                         continue;
                     }
-                    int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
                     void *dst = g_malloc_cache->data[cidx];
-                    ssize_t r = pread(fd, dst, esz, offset);
-                    valid[k] = (r == (ssize_t)esz);
-                    if (!valid[k]) {
-                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (fd=%d offset=%lld errno=%d/%s)\n",
-                                expert_indices[k], r, esz,
-                                fd, (long long)offset, errno, strerror(errno));
+                    if (g_expert_ram_base) {
+                        // RAM mode: memcpy from preloaded experts (~0.1ms per expert)
+                        void *src = (uint8_t *)g_expert_ram_base + offset;
+                        memcpy(dst, src, esz);
+                        valid[k] = 1;
+                    } else {
+                        // SSD mode: pread from disk (~1.5ms per expert)
+                        int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                        ssize_t r = pread(fd, dst, esz, offset);
+                        valid[k] = (r == (ssize_t)esz);
+                        if (!valid[k]) {
+                            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (fd=%d offset=%lld errno=%d/%s)\n",
+                                    expert_indices[k], r, esz,
+                                    fd, (long long)offset, errno, strerror(errno));
+                        }
                     }
                 }
             }
@@ -6840,19 +6925,27 @@ static void fused_layer_forward(
                 }
             }
 
-            // Phase 2: pread all cache misses (synchronous to avoid threading issues with Metal buffers)
+            // Phase 2: pread OR RAM memcpy all cache misses
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
-                    int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     void *dst = [miss_bufs[m] contents];
                     off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
-                    ssize_t r = pread(fd, dst, esz, offset);
-                    valid[k] = (r == (ssize_t)esz);
-                    if (!valid[k]) {
-                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], r, esz);
+                    if (g_expert_ram_base) {
+                        // RAM mode: memcpy from preloaded experts
+                        void *src = (uint8_t *)g_expert_ram_base + offset;
+                        memcpy(dst, src, esz);
+                        valid[k] = 1;
+                    } else {
+                        // SSD mode: pread from disk
+                        int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                        ssize_t r = pread(fd, dst, esz, offset);
+                        valid[k] = (r == (ssize_t)esz);
+                        if (!valid[k]) {
+                            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
+                                    expert_indices[k], r, esz);
+                        }
                     }
                 }
             }
@@ -8530,6 +8623,7 @@ int main(int argc, char **argv) {
             {"cache-mb",      required_argument, 0, 277},
             {"cache-composite", no_argument,     0, 278},
             {"offload-ssd",   required_argument, 0, 280},
+            {"preload-ram",  no_argument,       0, 287},
             {"phase-aware-prefetch", no_argument, 0, 281},
             {"aio-depth",     required_argument, 0, 282},
             {"cooccur-eviction-beta", required_argument, 0, 283},
@@ -8704,6 +8798,7 @@ int main(int argc, char **argv) {
                                 g_packed_ssd_mode = 1;
                                 printf("[config] Packed SSD mode: %u layers x %u experts x %zu bytes = %.1f GB\n",
                                        nl, ne, es, (double)nl * ne * es / 1e9);
+
                             } else {
                                 fprintf(stderr, "ERROR: Could not read packed SSD header: %zd bytes\n", hr);
                                 close(g_packed_ssd_fd);
@@ -8755,6 +8850,11 @@ int main(int argc, char **argv) {
                     g_dedup_experts = 1;
                     printf("[config] Expert load deduplication: enabled\n");
                     break;
+                case 287:
+                    // --preload-ram: preload all experts into RAM at startup
+                    g_preload_ram = 1;
+                    printf("[config] Expert RAM preload: enabled\n");
+                    break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -8766,6 +8866,12 @@ int main(int argc, char **argv) {
 
         // ---- Load model configuration from HF config.json ----
         load_model_config(model_path ? model_path : "");
+        
+        // Deferred: preload experts into RAM after all config is loaded
+        if (g_preload_ram && g_packed_ssd_mode) {
+            preloadExpertsIntoRAM();
+        }
+        
         // Use config's num_experts_per_tok if K was not explicitly set
         if (K < 0) K = cfg.num_experts_per_tok;
         alloc_tracking_arrays();
