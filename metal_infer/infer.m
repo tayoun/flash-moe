@@ -6835,7 +6835,7 @@ static void fused_layer_forward(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
-    if ((packed_fd >= 0 || g_packed_ssd_mode) && g_metal && g_metal->buf_multi_expert_data[0]) {
+    if ((packed_fd >= 0 || g_packed_ssd_mode || g_slot_bank) && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
         // For each expert:
         //   - Cache HIT:  dispatch directly from cached Metal buffer (skip pread)
