@@ -71,6 +71,7 @@
 
 // Expert offload SSD staging buffer
 #include "expert_offload.h"
+#import "SlotBank.h"
 
 // ============================================================================
 // Runtime model configuration (populated from HuggingFace config.json)
@@ -478,6 +479,9 @@ static uint64_t g_pred_layers = 0;
 // Expert offload SSD staging buffer
 static int g_offload_enabled = 0;       // --offload-ssd flag
 static char *g_offload_ssd_path = NULL;  // path to packed_experts_ssd.bin or dir
+static char *g_experts_dir = NULL;
+static int g_slot_bank_size = 32;
+static SlotBank *g_slot_bank = nil;
 
 // Packed sequential SSD mode (single .bin file, all experts concatenated)
 static int g_packed_ssd_mode = 0;
@@ -556,6 +560,7 @@ static inline void expert_mark_seen(int layer, int expert) {
 // g_nocache_mode=1: always cold fd (F_NOCACHE — best for 122B where experts >> RAM)
 // g_nocache_mode=2: tiered — cold for first read, warm for repeats
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
+    if (g_experts_dir && !g_packed_ssd_mode) return -1;
     if (g_packed_ssd_mode) return g_packed_ssd_fd;  // single fd for packed .bin
     if (g_nocache_mode == 0) return warm_fd;
     if (g_nocache_mode == 1) {
@@ -650,6 +655,7 @@ static inline int expert_physical_pos(int layer, int expert_id) {
 // Compute file offset for an expert, accounting for permutation
 // In packed SSD mode: header(16) + (layer * num_experts + expert) * expert_size
 static inline off_t expert_file_offset(int layer, int expert_id, size_t esz) {
+    if (g_experts_dir && !g_packed_ssd_mode) return 0;
     if (g_packed_ssd_mode) {
         return 16 + (off_t)layer * g_packed_num_experts * g_packed_expert_size
                + (off_t)expert_id * g_packed_expert_size;
@@ -6839,7 +6845,18 @@ static void fused_layer_forward(
         int valid[MAX_K];
         id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
 
-        if (g_malloc_cache) {
+        if (g_slot_bank) {
+            SlotBankResult r = [g_slot_bank loadLayer:layer_idx expertIds:expert_indices count:actual_K];
+            for (int k = 0; k < actual_K; k++) {
+                int slotIdx = r.slotIds[k];
+                void *slotPtr = [g_slot_bank bufferPointerForSlot:slotIdx];
+                expert_bufs[k] = [g_metal->device newBufferWithBytesNoCopy:slotPtr
+                                                                   length:active_expert_size()
+                                                                  options:MTLResourceStorageModeShared
+                                                              deallocator:nil];
+                valid[k] = (slotPtr != NULL);
+            }
+        } else if (g_malloc_cache) {
             // ---- Malloc cache path (zero-copy Metal buffer wrappers) ----
             // Phase 1: check cache for each expert, collect misses
             int miss_indices[MAX_K];
@@ -6879,12 +6896,10 @@ static void fused_layer_forward(
                     off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
                     void *dst = g_malloc_cache->data[cidx];
                     if (g_expert_ram_base) {
-                        // RAM mode: memcpy from preloaded experts (~0.1ms per expert)
                         void *src = (uint8_t *)g_expert_ram_base + offset;
                         memcpy(dst, src, esz);
                         valid[k] = 1;
                     } else {
-                        // SSD mode: pread from disk (~1.5ms per expert)
                         int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                         ssize_t r = pread(fd, dst, esz, offset);
                         valid[k] = (r == (ssize_t)esz);
@@ -7053,6 +7068,10 @@ static void fused_layer_forward(
         }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
+
+        if (g_slot_bank && g_pred_enabled && g_pred_generating) {
+            [g_slot_bank prefetchLayer:layer_idx expertIds:expert_indices count:actual_K];
+        }
 
         // Store this layer's routing for next token's temporal prediction.
         // MUST happen AFTER the prediction hit check above (which reads g_pred_experts).
@@ -8534,6 +8553,8 @@ static void print_usage(const char *prog) {
     printf("  --cache-mb N         Expert cache budget in MB (converts to entries automatically)\n");
     printf("  --cache-composite    A2: Use composite eviction (LRU + frequency) instead of pure LRU\n");
     printf("  --offload-ssd PATH   Enable expert offload staging buffer (path to packed_experts dir or .bin file)\n");
+    printf("  --experts-dir PATH   Per-layer expert export dir (default: experts_122b/)\n");
+    printf("  --slot-bank-size N   SlotBank slots (default: 32)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -8623,6 +8644,8 @@ int main(int argc, char **argv) {
             {"cache-mb",      required_argument, 0, 277},
             {"cache-composite", no_argument,     0, 278},
             {"offload-ssd",   required_argument, 0, 280},
+            {"experts-dir",   required_argument, 0, 288},
+            {"slot-bank-size", required_argument, 0, 289},
             {"preload-ram",  no_argument,       0, 287},
             {"phase-aware-prefetch", no_argument, 0, 281},
             {"aio-depth",     required_argument, 0, 282},
@@ -8811,6 +8834,15 @@ int main(int argc, char **argv) {
                     printf("[config] Expert offload: enabled (SSD: %s)\n", g_offload_ssd_path);
                     break;
                 }
+                case 288:
+                    g_experts_dir = strdup(optarg);
+                    printf("[config] Experts dir: %s\n", g_experts_dir);
+                    break;
+                case 289:
+                    g_slot_bank_size = atoi(optarg);
+                    if (g_slot_bank_size < 1) g_slot_bank_size = 32;
+                    printf("[config] SlotBank size: %d\n", g_slot_bank_size);
+                    break;
                 case 281:
                     // --phase-aware-prefetch: after attention RMSNorm, prefetch next layer's experts
                     g_phase_aware_prefetch = 1;
@@ -9067,7 +9099,18 @@ int main(int argc, char **argv) {
         io_pool_init();
         infer_prefetch_init();
 
-        // ---- Initialize expert offload SSD staging buffer (if requested) ----
+        // ---- Initialize expert sources ----
+        if (!g_experts_dir) {
+            g_experts_dir = strdup("experts_122b");
+        }
+        if (g_experts_dir) {
+            g_slot_bank = [[SlotBank alloc] initWithExpertsDir:[NSString stringWithUTF8String:g_experts_dir]
+                                                   numLayers:cfg.num_layers
+                                                  expertSize:cfg.expert_size_4bit
+                                                       maxK:cfg.num_experts
+                                                cacheIOSplit:0];
+            [g_slot_bank setSlotBankSize:g_slot_bank_size];
+        }
         if (g_offload_enabled && g_offload_ssd_path) {
             if (expert_offload_init(g_offload_ssd_path) != 0) {
                 fprintf(stderr, "WARNING: expert_offload_init failed, continuing without offload\n");

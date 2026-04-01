@@ -56,8 +56,8 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine
-$(INFER_TARGET): $(INFER_SRC) expert_offload.c expert_offload.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) expert_offload.c -o $(INFER_TARGET)
+$(INFER_TARGET): $(INFER_SRC) expert_offload.c expert_offload.h SlotBank.m SlotBank.h slot_bank_io.c slot_bank_io.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) expert_offload.c SlotBank.m slot_bank_io.c -o $(INFER_TARGET)
 
 $(CHAT_TARGET): $(CHAT_SRC) linenoise.c
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
