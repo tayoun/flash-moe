@@ -2120,6 +2120,103 @@ static void cpu_softmax(float *x, int dim) {
     }
 }
 
+// Gemma CPU attention forward (single-token decode or prefill)
+// Q: [num_q_heads, head_dim] — already has QK norm applied
+// K_cache: [max_len, num_kv_heads, head_dim]
+// V_cache: [max_len, num_kv_heads, head_dim]
+// attn_out: [num_q_heads, head_dim] attention output
+// num_groups = num_q_heads / num_kv_heads (GQA: each group shares one KV head)
+static void gemma_cpu_attention_forward(
+    const float *Q,         // [num_q_heads, head_dim]
+    const float *K_cache,   // [max_len, num_kv_heads, head_dim]
+    const float *V_cache,   // [max_len, num_kv_heads, head_dim]
+    float *attn_out,        // [num_q_heads, head_dim] output
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_len,
+    int pos,
+    int sliding_window
+) {
+    int num_groups = num_q_heads / num_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim); // Gemma: no QK norm on scores, use 1/sqrt(d)
+
+    // Determine attention window
+    int start_pos = 0;
+    int seq_len = pos + 1;
+    if (sliding_window > 0 && seq_len > sliding_window + 1) {
+        start_pos = seq_len - sliding_window - 1;
+    }
+    int attn_len = seq_len - start_pos;
+
+    // Allocate scores buffer
+    float *scores = (float *)malloc(attn_len * sizeof(float));
+
+    for (int h = 0; h < num_q_heads; h++) {
+        int kv_h = h / num_groups; // which KV head this Q head attends to
+        const float *qh = Q + h * head_dim;
+        float *oh = attn_out + h * head_dim;
+
+        // Compute attention scores: Q[h] @ K[kv_h]^T for all positions in window
+        for (int t = 0; t < attn_len; t++) {
+            int cache_pos = start_pos + t;
+            const float *kh = K_cache + (size_t)cache_pos * num_kv_heads * head_dim + kv_h * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += qh[d] * kh[d];
+            }
+            scores[t] = dot * scale;
+        }
+
+        // Softmax with numerical stability
+        float max_score = scores[0];
+        for (int t = 1; t < attn_len; t++) {
+            if (scores[t] > max_score) max_score = scores[t];
+        }
+        float sum_exp = 0.0f;
+        for (int t = 0; t < attn_len; t++) {
+            scores[t] = expf(scores[t] - max_score);
+            sum_exp += scores[t];
+        }
+        for (int t = 0; t < attn_len; t++) {
+            scores[t] /= sum_exp;
+        }
+
+        // Weighted sum of V
+        memset(oh, 0, head_dim * sizeof(float));
+        for (int t = 0; t < attn_len; t++) {
+            int cache_pos = start_pos + t;
+            const float *vh = V_cache + (size_t)cache_pos * num_kv_heads * head_dim + kv_h * head_dim;
+            float w = scores[t];
+            for (int d = 0; d < head_dim; d++) {
+                oh[d] += w * vh[d];
+            }
+        }
+    }
+
+    free(scores);
+}
+
+// Gemma O projection: [hidden_dim, q_dim] BF16 @ [q_dim] → [hidden_dim]
+// o_w: [hidden_dim, q_dim] BF16
+// attn_out: [num_q_heads, head_dim] — flatten to [q_dim] where q_dim = num_q_heads * head_dim
+// out: [hidden_dim]
+static void gemma_o_proj(
+    const uint16_t *o_w,
+    const float *attn_out,
+    float *out,
+    int hidden_dim,
+    int q_dim
+) {
+    for (int i = 0; i < hidden_dim; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < q_dim; j++) {
+            sum += bf16_to_f32(o_w[i * q_dim + j]) * attn_out[j];
+        }
+        out[i] = sum;
+    }
+}
+
 // Top-K: find K largest indices from scores[dim]
 static void cpu_topk(const float *scores, int dim, int K, int *indices, float *values) {
     // Simple selection sort for small K
