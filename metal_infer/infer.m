@@ -1924,6 +1924,103 @@ static void cpu_rms_norm_weighted(
     }
 }
 
+// Gemma Q projection: BF16 matvec then per-head Q norm with learned weight
+// q_w: [q_dim, GEMMA_HIDDEN_DIM] BF16 where q_dim = num_q_heads * head_dim
+// input: [GEMMA_HIDDEN_DIM], normed: [GEMMA_HIDDEN_DIM]
+// q_out: [q_dim] (in-place per-head normalization)
+// q_norm_w: [num_q_heads, head_dim] BF16 — learned per-head weight
+static void gemma_q_proj_with_qnorm(
+    const uint16_t *q_w,
+    const float *normed,
+    float *q_out,
+    int num_q_heads,
+    int head_dim,
+    const uint16_t *q_norm_w,
+    float eps
+) {
+    // 1. BF16 matvec: q_hidden = W @ normed
+    int hidden = GEMMA_HIDDEN_DIM;
+    int q_dim = num_q_heads * head_dim;
+    for (int i = 0; i < q_dim; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden; j++) {
+            sum += bf16_to_f32(q_w[i * hidden + j]) * normed[j];
+        }
+        q_out[i] = sum;
+    }
+    // 2. Per-head RMS norm with learned weight
+    for (int h = 0; h < num_q_heads; h++) {
+        float *qh = q_out + h * head_dim;
+        const uint16_t *qnw = q_norm_w + h * head_dim;
+        cpu_rms_norm_weighted(qh, qnw, qh, head_dim, eps);
+    }
+}
+
+// Gemma K projection: BF16 matvec then per-head K norm with learned weight
+// k_w: [kv_dim, GEMMA_HIDDEN_DIM] BF16 where kv_dim = num_kv_heads * head_dim
+// For full attention: num_kv_heads=2, head_dim=512; sliding: num_kv_heads=8, head_dim=256
+static void gemma_k_proj_with_knorm(
+    const uint16_t *k_w,
+    const float *normed,
+    float *k_out,
+    int num_kv_heads,
+    int head_dim,
+    const uint16_t *k_norm_w,
+    float eps
+) {
+    int hidden = GEMMA_HIDDEN_DIM;
+    int kv_dim = num_kv_heads * head_dim;
+    for (int i = 0; i < kv_dim; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden; j++) {
+            sum += bf16_to_f32(k_w[i * hidden + j]) * normed[j];
+        }
+        k_out[i] = sum;
+    }
+    // Per-head K norm
+    for (int h = 0; h < num_kv_heads; h++) {
+        float *kh = k_out + h * head_dim;
+        const uint16_t *knw = k_norm_w + h * head_dim;
+        cpu_rms_norm_weighted(kh, knw, kh, head_dim, eps);
+    }
+}
+
+// Gemma V projection + V-norm (no learned weight — Gemma 4 specific)
+// v_w: [kv_dim, GEMMA_HIDDEN_DIM] BF16
+// v_out: [kv_dim]
+// v_norm_w: [num_kv_heads, head_dim] BF16 — learned per-head weight (same as k_norm_w)
+static void gemma_v_proj_with_vnorm(
+    const uint16_t *v_w,
+    const float *normed,
+    float *v_out,
+    int num_kv_heads,
+    int head_dim,
+    const uint16_t *v_norm_w,
+    float eps
+) {
+    int hidden = GEMMA_HIDDEN_DIM;
+    int kv_dim = num_kv_heads * head_dim;
+    // V projection matvec
+    for (int i = 0; i < kv_dim; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden; j++) {
+            sum += bf16_to_f32(v_w[i * hidden + j]) * normed[j];
+        }
+        v_out[i] = sum;
+    }
+    // Per-head V-norm (no learned weight — bare RMSNorm)
+    for (int h = 0; h < num_kv_heads; h++) {
+        float *vh = v_out + h * head_dim;
+        cpu_rms_norm_bare(vh, vh, head_dim, eps);
+    }
+}
+
+// K=V sharing: clone K as V (full attention layers only)
+// For full attention, k_out == v_out (same memory, no separate V projection)
+static void gemma_kv_share(float *k_out, float *v_out, int kv_dim) {
+    memcpy(v_out, k_out, kv_dim * sizeof(float));
+}
+
 // SwiGLU: out = silu(gate) * up
 static void cpu_swiglu(const float *gate, const float *up, float *out, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -3699,6 +3796,68 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
             kh[i + half]  = k0 * sin_a + k1 * cos_a;
         }
     }
+}
+
+// Gemma RoPE: applies rotary positional encoding to Q and K
+// For sliding attention: rotate all dimensions (partial_rotary_factor = 1.0)
+// For full attention: rotate only top partial_rotary_factor (0.25) of dimensions
+// The remaining (1 - partial_rotary_factor) dimensions have cos=1, sin=0 (untouched)
+// Gemma uses interleaved pairs: (x[2i], x[2i+1]) for each position
+//
+// q: [num_heads, head_dim] in-place
+// k: [num_kv_heads, head_dim] in-place
+// pos: current position in sequence
+static void gemma_apply_rope(
+    float *q,
+    float *k,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int pos,
+    float rope_theta,
+    float partial_rotary_factor
+) {
+    int rotary_dim = (int)(head_dim * partial_rotary_factor);
+    if (rotary_dim > head_dim) rotary_dim = head_dim;
+
+    // Precompute frequencies for rotary dimensions
+    // freq[i] = rope_theta ^ (-2i/head_dim) for i in 0..rotary_dim/2-1
+    float *freqs = (float *)malloc((rotary_dim / 2) * sizeof(float));
+    for (int i = 0; i < rotary_dim / 2; i++) {
+        float exponent = (float)(2 * i) / (float)head_dim;
+        freqs[i] = powf(rope_theta, -exponent); // rope_theta ^ (-2i/head_dim)
+    }
+
+    // Q rotation — interleaved pairs (x[2i], x[2i+1])
+    for (int h = 0; h < num_heads; h++) {
+        float *qh = q + h * head_dim;
+        for (int i = 0; i < rotary_dim / 2; i++) {
+            float angle = (float)pos * freqs[i];
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float q0 = qh[2 * i];
+            float q1 = qh[2 * i + 1];
+            qh[2 * i]     = q0 * cos_a - q1 * sin_a;
+            qh[2 * i + 1] = q0 * sin_a + q1 * cos_a;
+        }
+        // Dimensions past rotary_dim: leave as-is (cos=1, sin=0 equivalent)
+    }
+
+    // K rotation — same interleaved scheme
+    for (int h = 0; h < num_kv_heads; h++) {
+        float *kh = k + h * head_dim;
+        for (int i = 0; i < rotary_dim / 2; i++) {
+            float angle = (float)pos * freqs[i];
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float k0 = kh[2 * i];
+            float k1 = kh[2 * i + 1];
+            kh[2 * i]     = k0 * cos_a - k1 * sin_a;
+            kh[2 * i + 1] = k0 * sin_a + k1 * cos_a;
+        }
+    }
+
+    free(freqs);
 }
 
 // ============================================================================
