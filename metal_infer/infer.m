@@ -103,6 +103,30 @@
 #define PARTIAL_ROTARY      0.25f
 #define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
 
+// ============================================================================
+// Gemma 4 26B-A4B constants
+// ============================================================================
+#define GEMMA_HIDDEN_DIM              2816
+#define GEMMA_NUM_LAYERS              30
+#define GEMMA_NUM_EXPERTS             128
+#define GEMMA_NUM_EXPERTS_PER_TOK     8
+#define GEMMA_EXPERT_HIDDEN           704
+#define GEMMA_DENSE_FFN_HIDDEN        2112
+#define GEMMA_HEAD_DIM_SLIDING        256
+#define GEMMA_HEAD_DIM_FULL           512
+#define GEMMA_NUM_Q_HEADS_SLIDING     16
+#define GEMMA_NUM_Q_HEADS_FULL        16
+#define GEMMA_NUM_KV_HEADS_SLIDING    8
+#define GEMMA_NUM_KV_HEADS_FULL       2
+#define GEMMA_ROPE_THETA_SLIDING      10000.0f
+#define GEMMA_ROPE_THETA_FULL         1000000.0f
+// p-RoPE: only top 25% of dims rotated on full attention layers
+#define GEMMA_PROXY_ROTARY_FACTOR     0.25f
+#define GEMMA_SLIDING_WINDOW           1024
+#define GEMMA_RMS_NORM_EPS             1e-6f
+#define GEMMA_VOCAB_SIZE               262144
+#define GEMMA_FINAL_LOGIT_SOFTCA       30.0f
+
 // Expert packed binary layout (from existing code)
 #define EXPERT_SIZE         7077888
 
@@ -1776,6 +1800,26 @@ static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int
     for (int i = 0; i < dim; i++) {
         float weight = bf16_to_f32(w_bf16[i]);
         out[i] = x[i] * inv_rms * weight;
+    }
+}
+
+// Per-head RMSNorm with learned BF16 weight (for Q/K normalization)
+// x: [head_dim], w_bf16: [head_dim] BF16, out: [head_dim], eps: RMS_NORM_EPS
+// Computes: out = x * (weight / sqrt(rms(x) + eps))
+static void cpu_rms_norm_weighted(
+    const float *x,
+    const uint16_t *w_bf16,
+    float *out,
+    int dim,
+    float eps
+) {
+    float sum_sq = 0.0f;
+    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
+    float rms = sqrtf(sum_sq / dim + eps);
+    float inv_rms = 1.0f / rms;
+    for (int i = 0; i < dim; i++) {
+        float w = bf16_to_f32(w_bf16[i]);
+        out[i] = x[i] * inv_rms * w;
     }
 }
 
