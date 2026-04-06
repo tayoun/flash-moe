@@ -1,381 +1,269 @@
-# Gemma 4 Port Implementation Plan
+# Expert Streaming Gemma 4 26B-A4B — Implementation Plan
 
-**Goal:** Adapt `flash-moe` into a text-only Gemma 4 26B A4B inference path on Apple Silicon using SSD-streamed experts.
-**Spec:** `docs/gemma4/PORTING_PLAN.md`, `docs/gemma4/GAP_ANALYSIS.md`
-**Tech Stack:** Objective-C/C + Metal, Python safetensors tooling, HuggingFace tokenizer/config assets
-**Tasks:** 10 tasks across 5 waves
-**Effort:** human: ~1-2 review sessions / agent: ~180-260 min
+**Goal:** Implement SSD-streamed expert inference for Gemma 4 26B-A4B in the `flash-moe` engine, borrowing the native slot-bank pattern from the Anemll llama.cpp fork.
+**Spec:** Architecture at `g4.si5.pl` + slot-bank porting guide from `anemll/anemll-flash-llama.cpp`
+**Tech Stack:** Objective-C/C + Metal, Python safetensors tooling
+**Tasks:** 20 tasks across 4 waves
+**Effort:** human: ~2-3h / agent: ~300-400 min
 **Diagrams:** component, data flow, state, sequence
+
+---
 
 ## Architecture
 
-### Component Diagram
+### Gemma 4 26B-A4B — Key Numbers
 
-```text
-┌────────────────────────────┐
-│ Original Gemma checkpoint  │
-│ config.json                │
-│ tokenizer.json             │
-│ safetensors shards         │
-└──────────────┬─────────────┘
-               │
-               ▼
-┌────────────────────────────┐
-│ Python conversion layer    │
-│ - extract_weights.py       │
-│ - repack_experts.py        │
-│ - export_tokenizer.py      │
-│ - export_vocab.py          │
-└──────────────┬─────────────┘
-               │ produces
-               ▼
-┌────────────────────────────┐
-│ Runtime model directory    │
-│ model_weights.bin/json     │
-│ packed_experts/            │
-│ tokenizer.bin              │
-│ vocab.bin                  │
-└──────────────┬─────────────┘
-               │ loaded by
-               ▼
-┌────────────────────────────┐
-│ Metal runtime              │
-│ metal_infer/infer.m        │
-│ - config loader            │
-│ - layer binder             │
-│ - attention path           │
-│ - MoE routing              │
-│ - SSD expert streaming     │
-└──────────────┬─────────────┘
-               │
-               ▼
-┌────────────────────────────┐
-│ Validation harness         │
-│ smoke decode / logits      │
-│ one-layer checks           │
-│ prompt-template checks     │
-└────────────────────────────┘
+| Parameter | Value |
+|-----------|-------|
+| Total params | ~26B |
+| Active params | ~4B |
+| Hidden size | 2,816 |
+| Layers | 30 (5 sliding + 1 full pattern, last layer always full) |
+| Sliding attention | head_dim=256, 16 Q heads, 8 KV heads, theta=10K, full rotation |
+| Full attention | head_dim=512, 16 Q heads, 2 KV heads, theta=1M, p-RoPE=0.25, K=V sharing |
+| Dense FFN | GeGLU, hidden=2,112 (all layers, always-on) |
+| MoE | 128 experts, top-8 routing, expert hidden=704 |
+| Router | RMSNorm(no scale) → scale×1/√hidden → Linear→num_experts → softmax → top-k → per-expert scale |
+| Output combine | 1/√2 × (dense_out + moe_out), then post-norm |
+| Vocab | 262,144 |
+| Context | 256K |
+| Logit cap | tanh(x/30)×30 |
+
+### Expert Storage Layout (per layer)
+
+Each expert lives in a packed binary at `packed_experts/gemma4/layer_XX.bin`:
+```
+gate_up_proj: 2,816 × 704 BF16  (gate + up concatenated, 2,816×704 each)
+down_proj:    704 × 2,816 BF16
+```
+128 experts × (2,816×704×2 BF16 + header) ≈ 1.3 GB per layer on disk.
+30 layers × 1.3 GB ≈ 39 GB packed on SSD.
+
+### Parallel FFN + MoE Data Flow
+
+```
+pre-FFN residual (RMSNorm)
+    │
+    ├──▶ DENSE PATH ───────────────────────────────────────────────────────┐
+    │    gate_proj (2816×2112 BF16) → GeGLU                               │
+    │    up_proj   (2816×2112 BF16) ──→ element-wise × ──▶ down_proj      │
+    │                                                          │          │
+    │                                                     post_norm       │
+    │                                                          │          │
+    └────────────────────────────────────────────────────────────┴──────────┤
+                                                                         ▼
+pre-FFN residual ──▶ ROUTER ──▶ top-k expert ids + weights                 │
+                       │                                                   │
+                       ▼                                                   │
+              MoE PARALLEL PATH ──────────────────────────────────────────┤
+              (only top-8 experts loaded)                                 │
+              for each selected expert e:                                  │
+                  gate_up_w[e] → GeGLU ──▶ down_w[e]                      │
+                  weighted by top-k weight                               │
+                                                     post_norm (shared)   │
+                                                          │               │
+                             FINAL: residual + post_norm(dense_out + moe_out)
 ```
 
-### Data Flow Diagram
+### Native Slot-Bank Pattern (borrowed from llama.cpp)
 
-```text
-INPUT checkpoint
-  └─▶ VALIDATION
-       - config present?
-       - tokenizer present?
-       - shard index present?
-       - text-only tensors identifiable?
-         └─▶ TRANSFORM
-              - dense tensor extract
-              - routed expert packing
-              - tokenizer/vocab export
-                └─▶ PERSIST
-                     - model_weights.bin/json
-                     - packed_experts/
-                     - tokenizer.bin
-                     - vocab.bin
-                       └─▶ OUTPUT
-                            - infer loads Gemma config
-                            - one-token forward works
-                            - greedy decode works
+The key insight from the llama.cpp porting guide: instead of routing to global expert IDs (0-127),
+the runtime maps selected expert IDs → **slot IDs** within a fixed-size bank.
+
+```
+top-k expert ids:       [e5, e42, e17, e87, e3, e99, e22, e55]  (true expert IDs)
+slot ids:               [0, 1, 2, 3, 4, 5, 6, 7]              (local to bank)
 ```
 
-### State Diagram
+**Why this matters:** The matmul consumer only sees slot IDs (consecutive 0-N).
+No gaps, no global expert lookup. Miss handling (Oracle replay / temporal prefetch)
+is slot-id-based, not expert-id-based.
 
-```text
-DISCOVERED
-  │
-  ▼
-MAPPED
-  │  (tensor names + config understood)
-  ▼
-EXTRACTABLE
-  │  (conversion scripts emit valid runtime artifacts)
-  ▼
-LOADABLE
-  │  (runtime binds tensors without missing names)
-  ▼
-CORRECT
-  │  (one-layer / one-token outputs reasonable)
-  ▼
-DECODING
-  │  (end-to-end prompt works)
-  ▼
-OPTIMIZED
-```
+**Key runtime questions (from llama.cpp guide):**
+- Where are routed top-k expert IDs produced? → `gemma_layer_forward`, router forward
+- Which routed tensors consume those IDs? → expert matvecs (gate_up, down)
+- Which consumers need true expert IDs (not slot IDs)? → gating-weight lookup, per-expert scale
+- Are gate/up/down aligned to same expert-id contract? → YES for Gemma (gate_up_proj is one fused tensor)
 
-Invalid transitions:
-- `DISCOVERED -> DECODING` blocked by missing runtime artifacts
-- `EXTRACTABLE -> OPTIMIZED` blocked until correctness exists
-
-### Hero Flow Sequence
-
-```text
-User/Developer       Conversion Scripts         Runtime               Model Dir
-     │                      │                     │                      │
-     │ choose Gemma model   │                     │                      │
-     │─────────────────────▶│                     │                      │
-     │                      │ extract dense       │                      │
-     │                      │ pack experts        │─────────────────────▶│
-     │                      │ export tokenizer    │                      │
-     │                      │                     │ load config/artifacts│
-     │ run infer            │                     │─────────────────────▶│
-     │───────────────────────────────────────────▶│                      │
-     │                      │                     │ decode prompt        │
-     │◀───────────────────────────────────────────│                      │
-```
+---
 
 ## Waves
 
-## Wave 1 — Discovery + runtime generalization scaffolding
+### Wave 1 — Foundation (model config + layer classification + Python export)
+*Independent — all parallel*
 
-### Task 1: Gemma checkpoint reconnaissance artifact
+**Task 1: Gemma ModelConfig struct and accessors**
+- Add `ModelConfigGemma` with all Gemma 26B-A4B constants
+- Layer type classification: `is_full_attention_layer(i)`, `is_sliding_attention_layer(i)`
+- Per-layer attention geometry: `head_dim_for_layer(i)`, `kv_heads_for_layer(i)`, `rope_theta_for_layer(i)`, `pRoPE_factor_for_layer(i)`
+- MoE constants: `num_experts=128`, `top_k=8`, `expert_hidden=704`, `dense_ffn_hidden=2112`
+- `cfg_is_gemma()`
 
-**Goal:** Document the exact Gemma tensor/config surface needed by the port.
+**Task 2: Dual-path RMSNorm — Q/K norm vs V-norm**
+- Implement `cpu_rms_norm_with_scale(float *x, const uint16_t *w_bf16, float *out, int dim, float eps)` — Q/K norms (learned scale)
+- Implement `cpu_rms_norm_no_scale(float *x, float *out, int dim, float eps)` — V-norm (no learned params)
+- Both BF16 weight variants; V-norm is pure F32
 
-**Files:**
-- Create: `docs/specs/gemma4-port/checkpoint-notes.md`
-- Modify: `docs/gemma4/GAP_ANALYSIS.md`
+**Task 3: Gemma weight extraction in Python**
+- Read `config.json` from Gemma 4 26B-A4B checkpoint
+- Extract `model.language_model.*` text tensors (not vision_tower)
+- Dense weights: q_proj, k_proj, v_proj (or K=V), o_proj, gate_up_proj, down_proj
+- Layer norm weights: input_norm, post_attn_norm, pre_feedforward_layernorm, post_feedforward_layernorm, post_feedforward_layernorm_1, post_feedforward_layernorm_2
+- Q/K/V norm weights: q_norm, k_norm, v_norm
+- Router weights: gate (2816×128), per_expert_scale (128)
+- Per-layer scalars
+- Output: `model_weights.bin/json` for runtime loading
 
-**Steps:**
-1. Record Gemma text config values from `config.json`.
-2. Summarize tensor families from `model.safetensors.index.json`.
-3. Identify which vision/multimodal tensors are out of scope for text-only v1.
-4. Update gap analysis with concrete Gemma-vs-Qwen deltas.
+**Task 4: Gemma tokenizer + chat template export**
+- Export Gemma tokenizer with correct special token IDs
+- Implement Gemma chat template (turn markers, bos/eos handling)
+- Export vocab bin for runtime
 
-**Context:** Verified from the downloaded checkpoint: Gemma text config has **30 hidden layers** (`text_config.num_hidden_layers = 30`), **128 experts**, **top-k 8**, **hidden size 2816**, a **25 sliding-attention / 5 full-attention** layer schedule, and text tensors under `model.language_model.*`. If another source reports 42 layers, that appears to refer to a different Gemma variant, not this exact checkpoint.
-**Depends on:** none
-**Verify:** `test -f docs/specs/gemma4-port/checkpoint-notes.md`
-**Failure mode:** tensor names misread from index. **Handled?:** yes, by using raw index file. **Test?:** yes, manual file check.
+### Wave 2 — Attention path + dense FFN (CPU bring-up)
+*Depends on Wave 1*
 
-### Task 2: Introduce manifest-driven runtime config skeleton
+**Task 5: Gemma attention — Q/K projection + QK norm**
+- Q projection: BF16 matvec, then per-head RMS norm with learned weight (q_norm)
+- K projection: BF16 matvec, then per-head RMS norm with learned weight (k_norm)
+- K=V sharing for full attention layers: skip V projection, clone K as V
+- V norm (no scale): per-head RMS norm without learned weight
 
-**Goal:** Stop treating Qwen constants as the only architecture.
+**Task 6: Gemma RoPE — standard + p-RoPE**
+- Sliding layers: standard RoPE, theta=10K, full rotation (all dims)
+- Full layers: p-RoPE, theta=1M, partial=0.25 — only top 25% of dims rotated, rest cos=1, sin=0
+- Configurable per-layer via accessor functions
 
-**Files:**
-- Modify: `metal_infer/infer.m`
-- Modify: `metal_infer/extract_weights.py`
+**Task 7: KV cache — per-layer geometry + store**
+- Per-layer KV cache sizing based on layer type
+- Store K and V in cache (V = K when K=V sharing)
+- GQA grouping: each Q head group attends to one KV head
 
-**Steps:**
-1. Define a runtime config struct in `infer.m` loaded from manifest JSON.
-2. Extend manifest output in `extract_weights.py` to carry architecture + Gemma-friendly fields.
-3. Thread config object to code paths that currently derive layer type/count from constants.
-4. Preserve Qwen behavior as default path.
+**Task 8: CPU attention forward + O projection**
+- Attention scores: Q @ K^T (no QK scaling — Gemma uses QK norm)
+- Softmax, weighted V sum, O projection (BF16 matvec)
+- Sliding window support (if pos > window, start from pos-window)
 
-**Context:** do not fully de-hardcode kernels yet; create the load/bind seam first.
-**Depends on:** Task 1
-**Verify:** build passes: `make -C metal_infer infer`
-**Failure mode:** config read path breaks Qwen. **Handled?:** yes, preserve default fallback. **Test?:** yes, compile check.
+**Task 9: Dense FFN — GeGLU path**
+- gate_proj BF16 matvec → up_proj BF16 matvec
+- GeGLU: `out = gelu(gate) * up`, where gelu ≈ `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x³)))`
+- down_proj BF16 matvec
+- Post-norm on FFN output
 
-## Wave 2 — Conversion pipeline for Gemma
+**Task 10: Full gemma_layer_forward (dense + dense parallel)**
+- Wire: input RMS norm → Q/K/V → QK norm + V norm → RoPE → attention → O proj → residual add → post-attn RMS norm
+- → pre-FFN RMS norm → dense GeGLU path
+- → residual + 1/√2 × (dense_out + moe_out) → post-norm
+- Layer scalar applied at end
+- Dispatch between sliding and full attention geometry per layer
 
-### Task 3: Gemma-aware dense extractor
+### Wave 3 — MoE + Expert Streaming
+*Depends on Wave 2*
 
-**Goal:** Extract text-side non-expert tensors from Gemma safetensors into runtime format.
+**Task 11: Gemma router implementation**
+- RMSNorm (no learned scale) on pre-FFN hidden
+- Scale × 1/√hidden_size
+- matvec: W_gate (2816×128, BF16) → expert_scores (128)
+- softmax over expert_scores → probs
+- top-k (k=8): indices + weights
+- Per-expert scale multiply: `weights[e] *= per_expert_scale[e]`
+- Normalize: `weights /= weights.sum()`
+- Returns: `top_k_ids[8]`, `top_k_weights[8]`
 
-**Files:**
-- Modify: `metal_infer/extract_weights.py`
-- Create: `docs/specs/gemma4-port/extractor-map.md`
-- Create: `scripts/check_disk_space.sh`
+**Task 12: Expert binary layout + per-layer expert index**
+- Define `packed_experts/gemma4/layer_XX.bin` layout per spec above
+- Build expert index: for each layer, byte offsets for each expert's gate_up and down
+- `tools/gemma4/build_expert_index.py` — scan safetensors, produce `expert-index.json`
+- Expert index fields: `layer`, `expert_idx`, `gate_up_offset`, `gate_up_size`, `down_offset`, `down_size`
 
-**Steps:**
-1. Add model-type detection from `config.json`.
-2. Add a disk-space pre-check before extraction to estimate required output size and fail early if the target volume lacks headroom.
-3. Filter to `model.language_model.*` tensors and skip vision tensors for v1.
-4. Emit Gemma manifest config values from source config instead of hard-coded Qwen values.
-5. Record the emitted tensor-name map and skipped tensors.
-6. Explicitly document the memory ceiling risk: this source checkpoint is BF16/native and is not expected to fit the 16GB M4 runtime directly; the later 4-bit path is required for practical deployment on the Mac mini.
+**Task 13: Expert loading via pread (slot-bank aligned)**
+- `load_expert_slot(layer_idx, slot_id, expert_idx)` — reads one expert's gate_up + down from packed bin
+- Uses `pread()` for SSD-friendly offset reads
+- Bank size: 8 (max active experts) — preallocate slot storage
+- Miss handling: if expert not in bank, load from packed source
 
-**Context:** Gemma weights are BF16/native, not MLX 4-bit packed tensors like the current Qwen path. Extraction from BF16 is a bring-up step; deployment on the 16GB Mac mini will require a quantized/runtime-reduced artifact, and that transition should be called out explicitly when we introduce the 4-bit path.
-**Depends on:** Task 2
-**Verify:** run extractor in dry/small validation mode or header-only mode if implemented; otherwise verify manifest generation path with a limited sample and confirm disk pre-check output.
-**Failure mode:** accidentally skip required text tensors or start extraction without enough free space. **Handled?:** partially, via name map doc and disk pre-check. **Test?:** yes, manifest inspection and preflight check.
+**Task 14: MoE forward (top-8 expert routing + GeGLU + weighted accum)**
+- Given top_k_ids[8], top_k_weights[8], pre-FFN residual
+- For each slot s in 0..7:
+    - Load expert e = top_k_ids[s] into slot s via pread
+    - gate_up = gate_up_w[s] (2816×704 BF16)
+    - GeGLU(gate_up @ x) → intermediate
+    - down_w[s] (704×2816 BF16) @ intermediate → expert_out
+    - weighted: expert_out × top_k_weights[s], accumulate into moe_out[2816]
+- Apply post-norm, combine with dense FFN output via 1/√2
 
-### Task 4: Gemma expert index + packer design
+**Task 15: gemma_moe_expert_forward — slot-bank integration**
+- Takes layer_idx, pre-FFN residual, top_k_ids, top_k_weights
+- Manages slot bank state: which expert is in which slot (LRU or direct map)
+- Returns moe_out[2816] (already weighted and accumulated)
 
-**Goal:** Adapt `repack_experts.py` from Qwen fixed-layout packing to Gemma routed-expert packing.
+### Wave 4 — Integration + Validation
+*Depends on Wave 3*
 
-**Files:**
-- Modify: `repack_experts.py`
-- Create: `docs/specs/gemma4-port/expert-layout.md`
-- Create: `tools/gemma4/build_expert_index.py`
-- Create: `tools/gemma4/validate_expert_metadata.py`
+**Task 16: Wire gemma_layer_forward into main decode loop**
+- In main decode loop, detect `cfg_is_gemma()` and call `gemma_layer_forward` instead of `fused_layer_forward`
+- Pass KVCache pointer, position, hidden pointer
+- Verify one-token decode produces finite logits
 
-**Steps:**
-1. Define Gemma expert tensor layout from raw tensor names:
-   - `experts.gate_up_proj`
-   - `experts.down_proj`
-2. Determine packed blob format for streamed routed experts.
-3. Build a Gemma expert index generator from safetensors metadata.
-4. Add a **metadata-only validation step before packing** that verifies expert tensor shapes, strides, dtypes, and per-layer consistency against the runtime reader’s expected layout.
-5. Update repacker to support an architecture-specific expert layout spec.
+**Task 17: Final logit softcapping**
+- After LM head projection: `logits = tanh(logits / 30.0) * 30.0`
+- Gemma uses this instead of raw logits
 
-**Context:** Gemma appears to fuse gate+up in one tensor family; do not force Qwen’s 9-component layout. Metadata-only validation is required here so shape/layout mismatches are discovered before writing large packed artifacts.
-**Depends on:** Task 1
-**Verify:** `python3 tools/gemma4/build_expert_index.py --help` and metadata sanity output; `python3 tools/gemma4/validate_expert_metadata.py ...` reports pass before packing
-**Failure mode:** packed layout mismatches runtime reader. **Handled?:** partially, via metadata-only validation before pack. **Test?:** yes, metadata validation in this task and runtime validation in Wave 4.
+**Task 18: One-layer CPU reference (Python vs C diff)**
+- Implement `tools/gemma4/check_one_layer.py` reference: pure Python one-layer decode using safetensors
+- Extract layer 0 weights, run single forward pass
+- Compare logits against `infer` one-layer C output
+- Must match within 1e-3 at this stage (before MoE)
 
-## Wave 3 — Runtime binding + prompt path
+**Task 19: Flash-MOE slot-bank miss handling + oracle**
+- Implement miss detection: expert not in slot bank
+- Miss install: load from packed expert binary via pread
+- Oracle replay: record + replay top-k sequences for benchmark reproducibility
+- Prefetch: next token's top-k experts prefetched in background
 
-### Task 5: Gemma layer-cache binder
+**Task 20: End-to-end validation — logits + throughput**
+- Run `infer` on standard prompts ( Alpaca eval format)
+- Verify output tokens are valid (no NaN/Inf, vocab in range)
+- Benchmark: tokens/sec, first-token latency, decode speed
+- Compare against reference (transformers pipeline or llama.cpp branch)
 
-**Goal:** Bind Gemma tensor names into runtime layer structures without disturbing Qwen.
+---
 
-**Files:**
-- Modify: `metal_infer/infer.m`
+## Expert-Loading State Machine
 
-**Steps:**
-1. Split `build_layer_cache()` into architecture-specific binders.
-2. Add Gemma bindings for:
-   - norms
-   - attention q/k/v/o + q_norm/k_norm
-   - router tensors
-   - dense MLP tensors if needed
-3. Handle Gemma layer-type schedule from config (`sliding_attention` vs `full_attention`).
-4. Keep Qwen binder intact.
-
-**Context:** this is the critical runtime seam.
-**Depends on:** Task 2, Task 3
-**Verify:** runtime logs can enumerate all required tensor pointers without null failures in a validation mode
-**Failure mode:** missing tensor names crash at runtime. **Handled?:** yes, add explicit validation mode. **Test?:** yes.
-
-### Task 6: Gemma tokenizer + chat template path
-
-**Goal:** Make prompt encoding/serving produce valid Gemma conversations.
-
-**Files:**
-- Modify: `metal_infer/export_tokenizer.py`
-- Modify: `metal_infer/export_vocab.py`
-- Modify: `metal_infer/infer.m`
-- Create: `docs/specs/gemma4-port/prompt-format.md`
-
-**Steps:**
-1. Confirm tokenizer.json compatibility with current exporter.
-2. Add Gemma special-token handling as needed.
-3. Replace Qwen chat prompt construction with architecture-specific formatter.
-4. Use `chat_template.jinja` / tokenizer config as source of truth for v1 formatting.
-
-**Context:** current runtime hardcodes Qwen `<|im_start|>` format, which will be wrong for Gemma.
-**Depends on:** Task 1
-**Verify:** tokenize/decode smoke test with Gemma special tokens
-**Failure mode:** valid model, invalid prompt format. **Handled?:** yes. **Test?:** yes.
-
-## Wave 4 — Correctness bring-up
-
-### Task 7: One-layer CPU reference path for Gemma MoE
-
-**Goal:** Validate routed/shared expert math before full decode.
-
-**Files:**
-- Modify: `metal_infer/infer.m`
-- Create: `tools/gemma4/check_one_layer.py`
-
-**Steps:**
-1. Add a debug/validation path for one Gemma layer.
-2. Validate router top-k and expert output shape assumptions.
-3. Compare runtime intermediate outputs against a **PyTorch** reference implementation for one token.
-4. Record acceptable numerical tolerances.
-5. Add a lightweight coherence metric beyond “non-empty text” for bring-up quality, such as:
-   - repeated-token rate ceiling over a short decode window,
-   - EOS-within-range behavior,
-   - and/or perplexity/cross-entropy on a tiny fixed prompt continuation slice if feasible.
-
-**Context:** correctness before speed. PyTorch is the reference stack for v1 because it can read the original safetensors/config path directly with fewer translation assumptions than a NumPy-only reference.
-**Depends on:** Task 4, Task 5
-**Verify:** one-layer validation command returns pass/fail with tolerances and reports the chosen coherence metric
-**Failure mode:** MoE math wrong but hidden by full decode noise. **Handled?:** yes. **Test?:** yes.
-
-### Task 8: End-to-end single-token / short-prompt decode
-
-**Goal:** Get Gemma text-only decode working through the main infer path.
-
-**Files:**
-- Modify: `metal_infer/infer.m`
-- Modify: `metal_infer/Makefile`
-- Create: `docs/specs/gemma4-port/bringup-log.md`
-
-**Steps:**
-1. Load Gemma-extracted model directory.
-2. Run prefill + first decode token.
-3. Fix missing paths in norms, attention, lm_head, embeddings, or expert loading.
-4. Extend to a short greedy decode smoke run.
-
-**Context:** sliding attention can initially share the existing full-attention implementation if needed, even if not yet optimized.
-**Depends on:** Task 5, Task 6, Task 7
-**Verify:** short prompt returns text without runtime failure and meets the Wave 4 coherence threshold defined in Task 7 (not just non-empty output)
-**Failure mode:** decodes garbage due to prompt/template mismatch or attention bug. **Handled?:** partially. **Test?:** yes.
-
-## Wave 5 — Hardening + handoff
-
-### Task 9: Validation and regression harness
-
-**Goal:** Make future iteration safe.
-
-**Files:**
-- Create: `docs/specs/gemma4-port/test-matrix.md`
-- Create: `scripts/gemma4_smoke.sh`
-- Modify: `metal_infer/Makefile`
-
-**Steps:**
-1. Add repeatable smoke commands for extraction, binding, one-layer check, short decode.
-2. Create a small regression matrix for prompt, tokenization, tensor binding, and decode.
-3. Add make targets where useful.
-
-**Context:** this port will need many iterations; regression hygiene matters.
-**Depends on:** Task 8
-**Verify:** `bash scripts/gemma4_smoke.sh`
-**Failure mode:** future refactor silently breaks bring-up. **Handled?:** yes. **Test?:** yes.
-
-### Task 10: Optimization backlog + next-step brief
-
-**Goal:** Separate correctness completion from performance work.
-
-**Files:**
-- Create: `docs/specs/gemma4-port/optimization-backlog.md`
-- Modify: `docs/gemma4/PORTING_PLAN.md`
-
-**Steps:**
-1. List all deferred optimizations.
-2. Mark which can only begin after correctness.
-3. Define likely bottlenecks for M4 16GB.
-4. Create next-step brief for implementation sessions.
-
-**Context:** avoid mixing porting and optimization prematurely.
-**Depends on:** Task 8
-**Verify:** docs complete and reviewed
-**Failure mode:** team starts premature optimization. **Handled?:** yes. **Test?:** doc review.
-
-## Effort Summary
-
-- Total tasks: 10 across 5 waves
-- Parallelizable now:
-  - Wave 1 Task 1 and partial Task 2 can overlap
-  - Wave 2 Tasks 3 and 4 can overlap after reconnaissance
-  - Wave 5 Tasks 9 and 10 can overlap
-- Critical path:
-  - Task 1 → Task 2 → Task 3 → Task 5 → Task 6 → Task 7 → Task 8
+```
+INITIAL          → bank empty, no experts loaded
+TOKEN n FORWARD  → router produces top_k_ids[8]
+                  for each expert:
+                    if expert in bank:
+                      USE_SLOT(slot)
+                    else:
+                      MISS → LOAD_FROM_SSD → USE_SLOT(new_slot)
+                  run GeGLU + down_proj for each slot
+                  weighted accumulate → moe_out
+                  combine with dense FFN → residual add → next layer
+```
 
 ## Failure Modes Registry
 
 | Task | Failure Mode | Handled? | Test? | User Sees |
-|------|--------------|----------|-------|-----------|
-| 2 | Qwen runtime regresses | Yes | Yes | build/load failure |
-| 3 | Missing required Gemma tensors / insufficient disk | Partial | Yes | null tensor bind / preflight failure |
-| 4 | Wrong expert layout | Partial | Yes | metadata validation or expert forward mismatch |
-| 5 | Binder misses names | Yes | Yes | validation failure |
-| 6 | Bad chat template | Yes | Yes | garbage / empty output |
-| 7 | Router/expert math wrong | Yes | Yes | one-layer diff failure |
-| 8 | Decode unstable | Partial | Yes | wrong text / crash |
+|------|-------------|----------|-------|-----------|
+| 3 | Missing Gemma tensor names | Partial | Yes | null bind / preflight |
+| 5 | K=V sharing wrong path | Partial | Yes | attention regression |
+| 6 | p-RoPE dimensions wrong | Partial | Yes | garbage full-attention output |
+| 11 | Router softmax instability | No | Yes | all experts equal weight |
+| 13 | pread offset error | Partial | Yes | garbage expert weights |
+| 14 | Top-k weight normalization | Partial | Yes | MoE output too large |
+| 18 | Python/C logits mismatch | N/A | Yes | can't validate |
 
-## Readiness Gate
+## Test Plan
+See: `docs/specs/gemma4-port/test-plan.md`
 
-READINESS GATE
-══════════════
-Spec traceability:     PASS
-Constitution:          PASS
-Pattern consistency:   PASS with intentional deviation (new `tools/gemma4/` helpers)
-Ambiguity:             PASS for planning; implementation still depends on validating exact tensor shapes from the checkpoint
-Spec completeness:     PASS
+## READINESS GATE
+═══════════════
+Spec traceability:     PASS (all 20 tasks trace to g4.si5.pl architecture)
+Constitution:          N/A (no CONSTITUTION.md in this repo)
+Pattern consistency:   PASS (follows existing flash-moe patterns)
+Ambiguity:             0 unresolved markers
+Spec completeness:     PASS (parallel FFN+MoE, slot-bank, p-RoPE, K=V, logit cap all covered)
 
 Verdict: READY
