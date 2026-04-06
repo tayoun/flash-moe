@@ -446,6 +446,150 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
     return warm_fd;
 }
 
+// ============================================================================
+// Gemma 4 expert slot bank — pread()-based SSD-friendly loading
+// Loads gate_up + down projections from packed expert binaries using pread().
+// Bank: 8 slots (max active experts per token), LRU eviction.
+// ============================================================================
+
+// Gemma expert slot bank — max 8 active experts
+#define GEMMA_EXPERT_BANK_SIZE  8
+#define GEMMA_EXPERT_HIDDEN     704
+#define GEMMA_HIDDEN_DIM        2816
+
+// Per-slot storage (BF16)
+static uint16_t g_expert_bank_gate_up[GEMMA_EXPERT_BANK_SIZE][GEMMA_EXPERT_HIDDEN][GEMMA_HIDDEN_DIM];
+static uint16_t g_expert_bank_down[GEMMA_EXPERT_BANK_SIZE][GEMMA_HIDDEN_DIM][GEMMA_EXPERT_HIDDEN];
+static int g_expert_bank_valid[GEMMA_EXPERT_BANK_SIZE] = {0};
+static int g_expert_bank_id[GEMMA_EXPERT_BANK_SIZE] = {-1};  // which expert ID is in this slot
+static int g_expert_bank_lru[GEMMA_EXPERT_BANK_SIZE] = {0};  // LRU counter
+static int g_expert_bank_init = 0;
+
+// File handle for packed expert files (one per layer)
+static int g_expert_fd[GEMMA_NUM_LAYERS] = {-1};  // -1 = not open
+static char g_expert_path[256] = {0};  // base path for expert binaries
+
+// Expert file layout constants (must match build_expert_index.py output)
+// Header: 64 bytes
+// Each expert e: gate_up = 2 * 704 * 2816 * 2 = 7,963,648 bytes, down = 2816 * 704 * 2 = 3,965,312 bytes
+#define GEMMA_GATE_UP_BYTES  (2 * GEMMA_EXPERT_HIDDEN * GEMMA_HIDDEN_DIM * 2)  // 7,963,648
+#define GEMMA_DOWN_BYTES     (GEMMA_HIDDEN_DIM * GEMMA_EXPERT_HIDDEN * 2)       // 3,965,312
+#define GEMMA_EXPERT_TOTAL  (GEMMA_GATE_UP_BYTES + GEMMA_DOWN_BYTES)           // 11,928,960
+#define GEMMA_EXPERT_HEADER  64
+
+// Initialize expert bank
+static void init_expert_bank(void) {
+    if (g_expert_bank_init) return;
+    for (int i = 0; i < GEMMA_EXPERT_BANK_SIZE; i++) {
+        g_expert_bank_valid[i] = 0;
+        g_expert_bank_id[i] = -1;
+        g_expert_bank_lru[i] = 0;
+    }
+    g_expert_bank_init = 1;
+}
+
+// Open a layer's expert binary (lazy open)
+static int open_expert_layer(int layer_idx) {
+    if (layer_idx < 0 || layer_idx >= GEMMA_NUM_LAYERS) return -1;
+    if (g_expert_fd[layer_idx] >= 0) return g_expert_fd[layer_idx];
+
+    // Build path: g_expert_path/packed_experts/gemma4/layer_XX.bin
+    char path[512];
+    snprintf(path, sizeof(path), "%s/packed_experts/gemma4/layer_%02d.bin", g_expert_path, layer_idx);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "WARNING: cannot open expert file %s\n", path);
+        return -1;
+    }
+    g_expert_fd[layer_idx] = fd;
+    return fd;
+}
+
+// Set the base path for expert binaries (call this once at startup)
+static void set_expert_base_path(const char *base) {
+    strncpy(g_expert_path, base, sizeof(g_expert_path) - 1);
+    g_expert_path[sizeof(g_expert_path) - 1] = '\0';
+}
+
+// Load one expert into a slot using pread (SSD-friendly, no seek)
+// Returns: slot index (0-7) where expert was loaded, or -1 on error
+// If expert already in bank, returns existing slot without loading
+static int load_expert_slot(int layer_idx, int expert_id) {
+    init_expert_bank();
+
+    if (expert_id < 0 || expert_id >= GEMMA_NUM_EXPERTS) return -1;
+
+    // Check if already loaded
+    for (int s = 0; s < GEMMA_EXPERT_BANK_SIZE; s++) {
+        if (g_expert_bank_valid[s] && g_expert_bank_id[s] == expert_id) {
+            g_expert_bank_lru[s]++;  // bump LRU
+            return s;
+        }
+    }
+
+    // Find LRU slot to evict
+    int evict_slot = 0;
+    int min_lru = g_expert_bank_lru[0];
+    for (int s = 1; s < GEMMA_EXPERT_BANK_SIZE; s++) {
+        if (g_expert_bank_lru[s] < min_lru) {
+            min_lru = g_expert_bank_lru[s];
+            evict_slot = s;
+        }
+    }
+
+    // Open expert file for this layer
+    int fd = open_expert_layer(layer_idx);
+    if (fd < 0) return -1;
+
+    // Compute offset for this expert in the packed binary
+    off_t expert_base = GEMMA_EXPERT_HEADER + (off_t)expert_id * GEMMA_EXPERT_TOTAL;
+
+    // Read gate_up (7,963,648 bytes) into slot
+    ssize_t n = pread(fd, g_expert_bank_gate_up[evict_slot], GEMMA_GATE_UP_BYTES, expert_base);
+    if (n != GEMMA_GATE_UP_BYTES) {
+        fprintf(stderr, "WARNING: read gate_up expert %d: got %zd expected %d\n", expert_id, n, GEMMA_GATE_UP_BYTES);
+        return -1;
+    }
+
+    // Read down (3,965,312 bytes) into slot
+    n = pread(fd, g_expert_bank_down[evict_slot], GEMMA_DOWN_BYTES, expert_base + GEMMA_GATE_UP_BYTES);
+    if (n != GEMMA_DOWN_BYTES) {
+        fprintf(stderr, "WARNING: read down expert %d: got %zd expected %d\n", expert_id, n, GEMMA_DOWN_BYTES);
+        return -1;
+    }
+
+    // Mark slot as valid
+    g_expert_bank_valid[evict_slot] = 1;
+    g_expert_bank_id[evict_slot] = expert_id;
+    g_expert_bank_lru[evict_slot]++;  // bump LRU
+
+    return evict_slot;
+}
+
+// Preload a specific expert into a specific slot (no LRU update, for prefetch)
+static int preload_expert_slot(int slot, int layer_idx, int expert_id) {
+    init_expert_bank();
+    if (slot < 0 || slot >= GEMMA_EXPERT_BANK_SIZE) return -1;
+    if (expert_id < 0 || expert_id >= GEMMA_NUM_EXPERTS) return -1;
+
+    int fd = open_expert_layer(layer_idx);
+    if (fd < 0) return -1;
+
+    off_t expert_base = GEMMA_EXPERT_HEADER + (off_t)expert_id * GEMMA_EXPERT_TOTAL;
+
+    ssize_t n = pread(fd, g_expert_bank_gate_up[slot], GEMMA_GATE_UP_BYTES, expert_base);
+    if (n != GEMMA_GATE_UP_BYTES) return -1;
+
+    n = pread(fd, g_expert_bank_down[slot], GEMMA_DOWN_BYTES, expert_base + GEMMA_GATE_UP_BYTES);
+    if (n != GEMMA_DOWN_BYTES) return -1;
+
+    g_expert_bank_valid[slot] = 1;
+    g_expert_bank_id[slot] = expert_id;
+    // Don't update LRU for prefetch
+
+    return 0;
+}
+
 typedef enum {
     EXPERT_QUANT_4BIT = 0,
     EXPERT_QUANT_2BIT = 1,
