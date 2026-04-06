@@ -43,7 +43,7 @@ CHAT_SRC = chat.m
 CACHE_BENCH_TARGET = cachebench
 CACHE_BENCH_SRC = cache_pread_bench.c
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat cachebench cachebench-run
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat cachebench cachebench-run gemma-one-layer-check
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -113,3 +113,10 @@ chat-run: $(CHAT_TARGET)
 
 cachebench-run: $(CACHE_BENCH_TARGET)
 	./$(CACHE_BENCH_TARGET) --q3-experts --experts 128 --threads 8 --split 4 --passes 5
+
+gemma-one-layer-check: $(INFER_TARGET)
+	@echo "Usage:"
+	@echo "  ./infer --model <gemma_runtime_dir> --prompt \"Hello\" --tokens 16 --k 8 \\"
+	@echo "      --gemma-one-layer-dump /tmp/gemma_one_layer.json"
+	@echo "  python3 ../tools/gemma4/check_one_layer.py --checkpoint <gemma_ckpt_dir> \\"
+	@echo "      --runtime-dump /tmp/gemma_one_layer.json"

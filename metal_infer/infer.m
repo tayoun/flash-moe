@@ -168,6 +168,107 @@
 #define DOWN_S_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 #define DOWN_B_OFF_Q3_OUTLIER  DOWN_W_OFF_Q3_OUTLIER
 
+// ============================================================================
+// Gemma 4 26B-A4B configuration
+// ============================================================================
+
+typedef struct {
+    int hidden_dim;
+    int num_layers;
+    int num_experts;
+    int num_experts_per_tok;
+    int expert_hidden;
+    int dense_ffn_hidden;
+    int head_dim_sliding;
+    int head_dim_full;
+    int num_q_heads_sliding;
+    int num_q_heads_full;
+    int num_kv_heads_sliding;
+    int num_kv_heads_full;
+    float rope_theta_sliding;
+    float rope_theta_full;
+    float proxy_rotary_factor;
+    int sliding_window;
+    float rms_norm_eps;
+    int vocab_size;
+    float final_logit_softca;
+} GemmaConfig;
+
+static GemmaConfig g_gemma_config = {0};
+
+// Gemma 4 26B-A4B uses hybrid attention:
+//   Full attention layers: 5, 11, 17, 23, 29  (every 6th layer, starting at 5)
+//   Sliding attention layers: all others
+// Full attention: 512 head_dim, 2 KV heads, 1M rope theta, 0.25 partial rotary (p-RoPE)
+// Sliding attention: 256 head_dim, 8 KV heads, 10K rope theta, 1.0 full rotary
+
+static int is_full_attention_layer(int layer_idx) {
+    if (layer_idx < 0 || layer_idx >= GEMMA_NUM_LAYERS) return 0;
+    // Layers 5, 11, 17, 23, 29 are full attention (every 6th layer starting at 5)
+    return (layer_idx % 6 == 5);
+}
+
+static int is_sliding_attention_layer(int layer_idx) {
+    return !is_full_attention_layer(layer_idx);
+}
+
+static int gemma_head_dim(int layer_idx) {
+    return is_full_attention_layer(layer_idx)
+        ? GEMMA_HEAD_DIM_FULL
+        : GEMMA_HEAD_DIM_SLIDING;
+}
+
+static int gemma_num_kv_heads(int layer_idx) {
+    return is_full_attention_layer(layer_idx)
+        ? GEMMA_NUM_KV_HEADS_FULL
+        : GEMMA_NUM_KV_HEADS_SLIDING;
+}
+
+static float gemma_rope_theta(int layer_idx) {
+    return is_full_attention_layer(layer_idx)
+        ? GEMMA_ROPE_THETA_FULL
+        : GEMMA_ROPE_THETA_SLIDING;
+}
+
+static float gemma_partial_rotary_factor(int layer_idx) {
+    // Full attention layers use p-RoPE: only top 25% of dims rotated
+    // Sliding layers use full rotary
+    return is_full_attention_layer(layer_idx)
+        ? GEMMA_PROXY_ROTARY_FACTOR
+        : 1.0f;
+}
+
+static int cfg_is_gemma(void) {
+    return g_gemma_config.num_layers > 0;
+}
+
+static void load_gemma_config(void) {
+    g_gemma_config = (GemmaConfig){
+        .hidden_dim          = GEMMA_HIDDEN_DIM,
+        .num_layers          = GEMMA_NUM_LAYERS,
+        .num_experts         = GEMMA_NUM_EXPERTS,
+        .num_experts_per_tok = GEMMA_NUM_EXPERTS_PER_TOK,
+        .expert_hidden       = GEMMA_EXPERT_HIDDEN,
+        .dense_ffn_hidden    = GEMMA_DENSE_FFN_HIDDEN,
+        .head_dim_sliding    = GEMMA_HEAD_DIM_SLIDING,
+        .head_dim_full       = GEMMA_HEAD_DIM_FULL,
+        .num_q_heads_sliding = GEMMA_NUM_Q_HEADS_SLIDING,
+        .num_q_heads_full    = GEMMA_NUM_Q_HEADS_FULL,
+        .num_kv_heads_sliding = GEMMA_NUM_KV_HEADS_SLIDING,
+        .num_kv_heads_full   = GEMMA_NUM_KV_HEADS_FULL,
+        .rope_theta_sliding  = GEMMA_ROPE_THETA_SLIDING,
+        .rope_theta_full     = GEMMA_ROPE_THETA_FULL,
+        .proxy_rotary_factor = GEMMA_PROXY_ROTARY_FACTOR,
+        .sliding_window      = GEMMA_SLIDING_WINDOW,
+        .rms_norm_eps        = GEMMA_RMS_NORM_EPS,
+        .vocab_size          = GEMMA_VOCAB_SIZE,
+        .final_logit_softca  = GEMMA_FINAL_LOGIT_SOFTCA,
+    };
+    printf("[gemma] Config loaded: %d layers, %d experts, hidden=%d\n",
+           g_gemma_config.num_layers, g_gemma_config.num_experts,
+           g_gemma_config.hidden_dim);
+}
+
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
@@ -8558,7 +8659,8 @@ int main(int argc, char **argv) {
         }
 
         if (!g_stream_mode) {
-            printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+            printf("=== %s Metal Inference Engine ===\n",
+                   cfg_is_gemma() ? "Gemma 4 26B-A4B" : "Qwen3.5-397B-A17B");
             printf("Model:    %s\n", model_path);
             printf("Weights:  %s\n", weights_path);
             printf("Manifest: %s\n", manifest_path);
@@ -8598,6 +8700,26 @@ int main(int argc, char **argv) {
         }
 
         double t0 = now_ms();
+
+        // ---- Detect model architecture from manifest ----
+        {
+            @autoreleasepool {
+                NSData *data = [NSData dataWithContentsOfFile:
+                    [NSString stringWithUTF8String:manifest_path]];
+                if (data) {
+                    NSError *error = nil;
+                    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data
+                                                                     options:0
+                                                                       error:&error];
+                    if (root && !error) {
+                        NSString *model_family = root[@"model_family"];
+                        if (model_family && [[model_family lowercaseString] isEqualToString:@"gemma"]) {
+                            load_gemma_config();
+                        }
+                    }
+                }
+            }
+        }
 
         // ---- Load weights ----
         WeightFile *wf = open_weights(weights_path, manifest_path);
