@@ -197,6 +197,12 @@ typedef struct {
 
 static GemmaConfig g_gemma_config = {0};
 
+// Forward declarations (defined later)
+static void init_expert_bank(void);
+static void gemma_router(const float *hidden, const uint16_t *router_w,
+                         const uint16_t *per_expert_scale,
+                         int top_k_ids[8], float top_k_weights[8]);
+
 // Gemma scratch buffers — reusable during a single layer forward pass
 static float *g_gemma_h = NULL;        // [GEMMA_HIDDEN_DIM] hidden buffer
 static float *g_gemma_q = NULL;        // [16 * 512] Q buffer (max)
@@ -218,6 +224,7 @@ static void init_gemma_scratch(void) {
     g_gemma_ffn_gate = calloc(GEMMA_DENSE_FFN_HIDDEN, sizeof(float));
     g_gemma_ffn_up = calloc(GEMMA_DENSE_FFN_HIDDEN, sizeof(float));
     g_gemma_ffn_out = calloc(GEMMA_HIDDEN_DIM, sizeof(float));
+    init_expert_bank();
     g_gemma_scratch_inited = 1;
 }
 
@@ -458,8 +465,8 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 #define GEMMA_EXPERT_HIDDEN     704
 #define GEMMA_HIDDEN_DIM        2816
 
-// Per-slot storage (BF16)
-static uint16_t g_expert_bank_gate_up[GEMMA_EXPERT_BANK_SIZE][GEMMA_EXPERT_HIDDEN][GEMMA_HIDDEN_DIM];
+// Per-slot storage (BF16) — [slot][2][704][2816]: [0]=gate proj, [1]=up proj
+static uint16_t g_expert_bank_gate_up[GEMMA_EXPERT_BANK_SIZE][2][GEMMA_EXPERT_HIDDEN][GEMMA_HIDDEN_DIM];
 static uint16_t g_expert_bank_down[GEMMA_EXPERT_BANK_SIZE][GEMMA_HIDDEN_DIM][GEMMA_EXPERT_HIDDEN];
 static int g_expert_bank_valid[GEMMA_EXPERT_BANK_SIZE] = {0};
 static int g_expert_bank_id[GEMMA_EXPERT_BANK_SIZE] = {-1};  // which expert ID is in this slot
@@ -545,15 +552,28 @@ static int load_expert_slot(int layer_idx, int expert_id) {
     // Compute offset for this expert in the packed binary
     off_t expert_base = GEMMA_EXPERT_HEADER + (off_t)expert_id * GEMMA_EXPERT_TOTAL;
 
-    // Read gate_up (7,963,648 bytes) into slot
-    ssize_t n = pread(fd, g_expert_bank_gate_up[evict_slot], GEMMA_GATE_UP_BYTES, expert_base);
-    if (n != GEMMA_GATE_UP_BYTES) {
-        fprintf(stderr, "WARNING: read gate_up expert %d: got %zd expected %d\n", expert_id, n, GEMMA_GATE_UP_BYTES);
+    // gate_proj: expert_base + 0, size = 704 * 2816 * 2 = 3,981,824 bytes
+    // up_proj: expert_base + 3,981,824, size = 3,981,824 bytes
+    // down_proj: expert_base + 2 * 3,981,824 = expert_base + GEMMA_EXPERT_HIDDEN * GEMMA_HIDDEN_DIM * 4
+    size_t proj_bytes = (size_t)GEMMA_EXPERT_HIDDEN * GEMMA_HIDDEN_DIM * 2;  // 3,981,824 per proj
+
+    // Read gate proj into slot[0] — [704][2816] BF16
+    ssize_t n = pread(fd, g_expert_bank_gate_up[evict_slot][0], proj_bytes, expert_base);
+    if (n != (ssize_t)proj_bytes) {
+        fprintf(stderr, "WARNING: read gate_proj expert %d: got %zd expected %zu\n", expert_id, n, proj_bytes);
         return -1;
     }
 
-    // Read down (3,965,312 bytes) into slot
-    n = pread(fd, g_expert_bank_down[evict_slot], GEMMA_DOWN_BYTES, expert_base + GEMMA_GATE_UP_BYTES);
+    // Read up proj into slot[1] — [704][2816] BF16
+    n = pread(fd, g_expert_bank_gate_up[evict_slot][1], proj_bytes, expert_base + proj_bytes);
+    if (n != (ssize_t)proj_bytes) {
+        fprintf(stderr, "WARNING: read up_proj expert %d: got %zd expected %zu\n", expert_id, n, proj_bytes);
+        return -1;
+    }
+
+    // Read down proj
+    off_t down_offset = expert_base + 2 * proj_bytes;
+    n = pread(fd, g_expert_bank_down[evict_slot], GEMMA_DOWN_BYTES, down_offset);
     if (n != GEMMA_DOWN_BYTES) {
         fprintf(stderr, "WARNING: read down expert %d: got %zd expected %d\n", expert_id, n, GEMMA_DOWN_BYTES);
         return -1;
@@ -577,11 +597,18 @@ static int preload_expert_slot(int slot, int layer_idx, int expert_id) {
     if (fd < 0) return -1;
 
     off_t expert_base = GEMMA_EXPERT_HEADER + (off_t)expert_id * GEMMA_EXPERT_TOTAL;
+    size_t proj_bytes = (size_t)GEMMA_EXPERT_HIDDEN * GEMMA_HIDDEN_DIM * 2;
 
-    ssize_t n = pread(fd, g_expert_bank_gate_up[slot], GEMMA_GATE_UP_BYTES, expert_base);
-    if (n != GEMMA_GATE_UP_BYTES) return -1;
+    // Read gate proj into slot[0]
+    ssize_t n = pread(fd, g_expert_bank_gate_up[slot][0], proj_bytes, expert_base);
+    if (n != (ssize_t)proj_bytes) return -1;
 
-    n = pread(fd, g_expert_bank_down[slot], GEMMA_DOWN_BYTES, expert_base + GEMMA_GATE_UP_BYTES);
+    // Read up proj into slot[1]
+    n = pread(fd, g_expert_bank_gate_up[slot][1], proj_bytes, expert_base + proj_bytes);
+    if (n != (ssize_t)proj_bytes) return -1;
+
+    // Read down proj
+    n = pread(fd, g_expert_bank_down[slot], GEMMA_DOWN_BYTES, expert_base + 2 * proj_bytes);
     if (n != GEMMA_DOWN_BYTES) return -1;
 
     g_expert_bank_valid[slot] = 1;
@@ -2166,54 +2193,11 @@ static void gemma_dense_ffn(
     }
 }
 
-// ============================================================================
-// Gemma 4 MoE expert slot bank
-// 8-slot bank for top-8 expert routing.
-// load_expert_slot() and slot bank globals are populated by Task 13's
-// expert loading pipeline (async pread + cache lookup).
-// ============================================================================
-
-#define GEMMA_NUM_EXPERT_SLOTS  8
-
-// Expert slot bank: pre-loaded BF16 weights for the currently cached experts.
-// gate_up[slot][2][704][2816]: [0]=gate proj, [1]=up proj
-// down[slot][2816][704]: down proj
-static uint16_t g_expert_bank_gate_up[GEMMA_NUM_EXPERT_SLOTS][2][GEMMA_EXPERT_HIDDEN][GEMMA_HIDDEN_DIM];
-static uint16_t g_expert_bank_down[GEMMA_NUM_EXPERT_SLOTS][GEMMA_HIDDEN_DIM][GEMMA_EXPERT_HIDDEN];
-
-// Per-layer LRU state for slot assignment (8 slots, 128 experts per layer).
-// slot_lru[layer][slot] = expert_id currently cached in that slot (or -1 if empty).
-static int g_slot_lru[GEMMA_NUM_LAYERS][GEMMA_NUM_EXPERT_SLOTS];
-
-// Initialize slot LRU state
-static void init_expert_slot_bank(void) {
-    for (int l = 0; l < GEMMA_NUM_LAYERS; l++) {
-        for (int s = 0; s < GEMMA_NUM_EXPERT_SLOTS; s++) {
-            g_slot_lru[l][s] = -1;  // empty
-        }
-    }
-}
-
-// Simple round-robin slot assignment: maps expert_id → slot.
-// In production Task 13 replaces this with an LRU cache + async pread.
-static int load_expert_slot(int layer_idx, int expert_id) {
-    // Check if expert is already in a slot (LRU hit)
-    for (int s = 0; s < GEMMA_NUM_EXPERT_SLOTS; s++) {
-        if (g_slot_lru[layer_idx][s] == expert_id) {
-            return s;  // cache hit
-        }
-    }
-    // Find a free slot or evict the LRU slot (simple round-robin)
-    static int s_next_slot[GEMMA_NUM_LAYERS] = {0};
-    int slot = s_next_slot[layer_idx] % GEMMA_NUM_EXPERT_SLOTS;
-    s_next_slot[layer_idx]++;
-
-    // In a real implementation, Task 13 would pread the expert from SSD here.
-    // For now, the slot bank is assumed pre-populated by the caller.
-    // Just update the LRU tag.
-    g_slot_lru[layer_idx][slot] = expert_id;
-    return slot;
-}
+// Forward declaration (defined later in file)
+static void gemma_router(const float *hidden, const uint16_t *router_w,
+                         const uint16_t *per_expert_scale,
+                         int top_k_ids[GEMMA_TOP_K],
+                         float top_k_weights[GEMMA_TOP_K]);
 
 // Gemma MoE forward: top-8 expert routing + GeGLU + down projection + weighted accum
 // layer_idx: which layer (for expert loading)
@@ -2564,7 +2548,10 @@ static void gemma_layer_forward(
     const uint16_t *up_proj_w,        // [2112, 2816] BF16
     const uint16_t *down_proj_w,      // [2816, 2112] BF16
     const uint16_t *post_ffn_norm_w,   // [2816] BF16 (may be NULL)
-    const uint16_t *layer_scalar       // [1] BF16 (may be NULL)
+    const uint16_t *layer_scalar,      // [1] BF16 (may be NULL)
+    // MoE router weights (added in Task 15)
+    const uint16_t *router_w,         // [128, 2816] BF16 router weights
+    const uint16_t *per_expert_scale  // [128] BF16 per-expert temperature
 ) {
     init_gemma_scratch();
 
@@ -2642,26 +2629,35 @@ static void gemma_layer_forward(
         cpu_rms_norm(hidden, pre_ffn_norm_w, ffn_input, hidden_dim, eps);
     }
 
-    // ===== 10. Dense FFN (GeGLU) — gate, up, down =====
+    // ===== 10. MoE routing — get top-K expert ids and weights =====
+    int moe_ids[GEMMA_TOP_K];
+    float moe_weights[GEMMA_TOP_K];
+    gemma_router(ffn_input, router_w, per_expert_scale, moe_ids, moe_weights);
+
+    // ===== 11. MoE expert forward — route to top-K experts, weighted output =====
+    float moe_out[GEMMA_HIDDEN_DIM] = {0};
+    gemma_moe_forward(layer_idx, ffn_input, moe_ids, moe_weights, moe_out);
+
+    // ===== 12. Dense FFN (GeGLU) — gate, up, down =====
     memset(g_gemma_ffn_out, 0, hidden_dim * sizeof(float));
     gemma_dense_ffn(gate_proj_w, up_proj_w, down_proj_w,
                     ffn_input,
                     g_gemma_ffn_gate, g_gemma_ffn_up, g_gemma_ffn_out,
                     GEMMA_DENSE_FFN_HIDDEN, hidden_dim);
 
-    // ===== 11. Combine dense FFN with residual: hidden + (1/sqrt(2)) * ffn_out =====
+    // ===== 13. Combine dense FFN + MoE with 1/sqrt(2) scaling =====
     float combine_scale = 0.7071067811865476f; // 1/sqrt(2)
     for (int i = 0; i < hidden_dim; i++) {
-        hidden[i] = hidden[i] + combine_scale * g_gemma_ffn_out[i];
+        hidden[i] = hidden[i] + combine_scale * (g_gemma_ffn_out[i] + moe_out[i]);
     }
 
-    // ===== 12. Post-FFN RMS norm (may be NULL) =====
+    // ===== 14. Post-FFN RMS norm (may be NULL) =====
     if (post_ffn_norm_w) {
         cpu_rms_norm(hidden, post_ffn_norm_w, g_gemma_h, hidden_dim, eps);
         memcpy(hidden, g_gemma_h, hidden_dim * sizeof(float));
     }
 
-    // ===== 13. Layer scalar (may be NULL) =====
+    // ===== 15. Layer scalar (may be NULL) =====
     if (layer_scalar) {
         float scalar = bf16_to_f32(layer_scalar[0]);
         for (int i = 0; i < hidden_dim; i++) {
@@ -9647,6 +9643,7 @@ int main(int argc, char **argv) {
                         NSString *model_family = root[@"model_family"];
                         if (model_family && [[model_family lowercaseString] isEqualToString:@"gemma"]) {
                             load_gemma_config();
+                            set_expert_base_path(model_path);
                         }
                     }
                 }
