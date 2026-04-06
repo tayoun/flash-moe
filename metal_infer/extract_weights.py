@@ -169,15 +169,29 @@ def classify_tensor(name, model_family, include_experts):
     qwen_expert_pattern = re.compile(
         r'\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$'
     )
+    # Gemma 4 26B-A4B: MoE experts are layers.N.experts.gate_up_proj / down_proj
+    # Dense FFN uses mlp.gate_proj / up_proj / down_proj (extract these)
     gemma_expert_pattern = re.compile(r'\.experts\.(gate_up_proj|down_proj)$')
 
-    if name.startswith(("vision_tower", "model.visual", "model.vision_tower", "model.embed_vision")):
+    # Skip vision / audio / multimodal tensors
+    if name.startswith(("vision_tower", "model.visual", "model.vision_tower",
+                        "model.embed_vision", "model.audio_", "model.conformer")):
         return "skip_vision"
 
     if model_family == "gemma":
-        if not name.startswith("model.language_model."):
+        # Gemma 4 tensor names are like: model.language_model.layers.N.xxx or model.language_model.embed_tokens.weight
+        # Strip the model.language_model. prefix to get the local name
+        local_name = name
+        if name.startswith("model.language_model."):
+            local_name = name[len("model.language_model."):]
+        is_layer = local_name.startswith("layers.")
+        is_top_level = local_name in ("embed_tokens.weight", "final_norm.weight",
+                                       "lm_head.weight", "norm.weight")
+        is_gemma = is_layer or is_top_level
+
+        if not is_gemma:
             return "skip_non_text"
-        if not include_experts and gemma_expert_pattern.search(name):
+        if not include_experts and gemma_expert_pattern.search(local_name):
             return "skip_expert"
         return "extract"
 
@@ -188,6 +202,7 @@ def classify_tensor(name, model_family, include_experts):
 
 def sanitize_name(name, model_family):
     if model_family == "gemma":
+        # Strip model.language_model. prefix for Gemma
         if name.startswith("model.language_model."):
             return name[len("model.language_model."):]
         return name
