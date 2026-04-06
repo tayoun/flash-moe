@@ -196,6 +196,38 @@ typedef struct {
 
 static GemmaConfig g_gemma_config = {0};
 
+// Gemma scratch buffers — reusable during a single layer forward pass
+static float *g_gemma_h = NULL;        // [GEMMA_HIDDEN_DIM] hidden buffer
+static float *g_gemma_q = NULL;        // [16 * 512] Q buffer (max)
+static float *g_gemma_k = NULL;        // [8 * 512] K buffer (max)
+static float *g_gemma_v = NULL;        // [8 * 512] V buffer (max)
+static float *g_gemma_attn = NULL;     // [16 * 512] attention output
+static float *g_gemma_ffn_gate = NULL; // [GEMMA_DENSE_FFN_HIDDEN] gate projection output
+static float *g_gemma_ffn_up = NULL;   // [GEMMA_DENSE_FFN_HIDDEN] up projection output
+static float *g_gemma_ffn_out = NULL;  // [GEMMA_HIDDEN_DIM] FFN output
+static int g_gemma_scratch_inited = 0;
+
+static void init_gemma_scratch(void) {
+    if (g_gemma_scratch_inited) return;
+    g_gemma_h = calloc(GEMMA_HIDDEN_DIM, sizeof(float));
+    g_gemma_q = calloc(16 * 512, sizeof(float));
+    g_gemma_k = calloc(8 * 512, sizeof(float));
+    g_gemma_v = calloc(8 * 512, sizeof(float));
+    g_gemma_attn = calloc(16 * 512, sizeof(float));
+    g_gemma_ffn_gate = calloc(GEMMA_DENSE_FFN_HIDDEN, sizeof(float));
+    g_gemma_ffn_up = calloc(GEMMA_DENSE_FFN_HIDDEN, sizeof(float));
+    g_gemma_ffn_out = calloc(GEMMA_HIDDEN_DIM, sizeof(float));
+    g_gemma_scratch_inited = 1;
+}
+
+// KVCache for full attention layers (also used by Gemma)
+// Layout: [max_seq, num_kv_heads * head_dim]
+typedef struct {
+    float *k_cache;
+    float *v_cache;
+    int len;  // current number of cached entries
+} KVCache;
+
 // Gemma 4 26B-A4B uses hybrid attention:
 //   Full attention layers: 5, 11, 17, 23, 29  (every 6th layer, starting at 5)
 //   Sliding attention layers: all others
@@ -2217,6 +2249,154 @@ static void gemma_o_proj(
     }
 }
 
+// ============================================================================
+// Gemma 4 full-layer forward pass — attention + dense FFN
+// ============================================================================
+
+// Forward declarations — defined later in this file
+static void gemma_apply_rope(float *q, float *k, int num_heads, int num_kv_heads,
+                              int head_dim, int pos, float rope_theta,
+                              float partial_rotary_factor);
+static void gemma_kv_cache_store(float *kv_cache_k, float *kv_cache_v,
+                                  const float *k_in, const float *v_in,
+                                  int num_kv_heads, int head_dim,
+                                  int max_len, int pos);
+
+// Gemma layer forward — complete single-layer forward pass
+// hidden: [GEMMA_HIDDEN_DIM] in/out — input and output hidden states
+// kv: pointer to this layer's KVCache struct (k_cache, v_cache, max_len)
+// layer_idx: which layer (0-29)
+// pos: current position for RoPE
+//
+// Layer weight pointers come from the layer cache binding (wired in Wave 3 Task 5):
+//   input_norm_w, q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_norm_w, v_norm_w,
+//   o_proj_w, post_attn_norm_w, pre_ffn_norm_w, gate_proj_w, up_proj_w,
+//   down_proj_w, post_ffn_norm_w, layer_scalar
+static void gemma_layer_forward(
+    float *hidden,              // [GEMMA_HIDDEN_DIM] in/out
+    KVCache *kv,                // KV cache for this layer
+    int layer_idx,
+    int pos,
+    const uint16_t *input_norm_w,     // [2816] BF16
+    const uint16_t *q_proj_w,          // [q_dim, 2816] BF16
+    const uint16_t *k_proj_w,          // [kv_dim, 2816] BF16
+    const uint16_t *v_proj_w,         // [kv_dim, 2816] BF16 (same as k for K=V)
+    const uint16_t *q_norm_w,          // [num_q_heads, head_dim] BF16
+    const uint16_t *k_norm_w,          // [num_kv_heads, head_dim] BF16
+    const uint16_t *v_norm_w,          // [num_kv_heads, head_dim] BF16
+    const uint16_t *o_proj_w,          // [2816, q_dim] BF16
+    const uint16_t *post_attn_norm_w,  // [2816] BF16
+    const uint16_t *pre_ffn_norm_w,    // [2816] BF16
+    const uint16_t *gate_proj_w,      // [2112, 2816] BF16
+    const uint16_t *up_proj_w,        // [2112, 2816] BF16
+    const uint16_t *down_proj_w,      // [2816, 2112] BF16
+    const uint16_t *post_ffn_norm_w,   // [2816] BF16 (may be NULL)
+    const uint16_t *layer_scalar       // [1] BF16 (may be NULL)
+) {
+    init_gemma_scratch();
+
+    int hidden_dim = GEMMA_HIDDEN_DIM;
+    int num_q_heads = is_full_attention_layer(layer_idx)
+        ? GEMMA_NUM_Q_HEADS_FULL
+        : GEMMA_NUM_Q_HEADS_SLIDING;
+    int num_kv_heads = gemma_num_kv_heads(layer_idx);
+    int head_dim = gemma_head_dim(layer_idx);
+    float rope_theta = gemma_rope_theta(layer_idx);
+    float partial_rotary = gemma_partial_rotary_factor(layer_idx);
+    float eps = GEMMA_RMS_NORM_EPS;
+    int sliding_window = is_full_attention_layer(layer_idx) ? 0 : GEMMA_SLIDING_WINDOW;
+    int q_dim = num_q_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // ===== 1. Input RMS norm =====
+    cpu_rms_norm(hidden, input_norm_w, g_gemma_h, hidden_dim, eps);
+
+    // ===== 2. Q/K/V projections + norms =====
+    // Q: matvec + per-head Q norm with learned weight
+    gemma_q_proj_with_qnorm(q_proj_w, g_gemma_h, g_gemma_q,
+                            num_q_heads, head_dim, q_norm_w, eps);
+
+    // K: matvec + per-head K norm with learned weight
+    gemma_k_proj_with_knorm(k_proj_w, g_gemma_h, g_gemma_k,
+                            num_kv_heads, head_dim, k_norm_w, eps);
+
+    // V: K=V sharing on full attention layers; separate V projection on sliding
+    if (is_full_attention_layer(layer_idx)) {
+        // K=V: clone K as V (same projected values, same norm weights)
+        gemma_kv_share(g_gemma_k, g_gemma_v, kv_dim);
+        // Apply per-head V-norm using k_norm_w (same as v_norm_w for full attn)
+        for (int h = 0; h < num_kv_heads; h++) {
+            float *vh = g_gemma_v + h * head_dim;
+            const uint16_t *vnw = k_norm_w + h * head_dim;  // same as v_norm_w
+            cpu_rms_norm_weighted(vh, vnw, vh, head_dim, eps);
+        }
+    } else {
+        // Separate V projection + per-head V-norm
+        gemma_v_proj_with_vnorm(v_proj_w, g_gemma_h, g_gemma_v,
+                                 num_kv_heads, head_dim, v_norm_w, eps);
+    }
+
+    // ===== 3. RoPE on Q and K =====
+    gemma_apply_rope(g_gemma_q, g_gemma_k, num_q_heads, num_kv_heads,
+                    head_dim, pos, rope_theta, partial_rotary);
+
+    // ===== 4. Store K,V into cache =====
+    gemma_kv_cache_store(kv->k_cache, kv->v_cache, g_gemma_k, g_gemma_v,
+                         num_kv_heads, head_dim, MAX_SEQ_LEN, pos);
+
+    // ===== 5. Attention (CPU flash attention) =====
+    memset(g_gemma_attn, 0, q_dim * sizeof(float));
+    gemma_cpu_attention_forward(g_gemma_q, kv->k_cache, kv->v_cache,
+                                 g_gemma_attn, num_q_heads, num_kv_heads,
+                                 head_dim, MAX_SEQ_LEN, pos, sliding_window);
+
+    // ===== 6. O projection =====
+    // Reuse g_gemma_h as the O proj output buffer
+    float *o_out = g_gemma_h;
+    gemma_o_proj(o_proj_w, g_gemma_attn, o_out, hidden_dim, q_dim);
+
+    // ===== 7. Residual add 1 (post-attention) =====
+    for (int i = 0; i < hidden_dim; i++) {
+        hidden[i] = hidden[i] + o_out[i];
+    }
+
+    // ===== 8. Post-attention RMS norm =====
+    cpu_rms_norm(hidden, post_attn_norm_w, g_gemma_h, hidden_dim, eps);
+
+    // ===== 9. Pre-FFN RMS norm (in-place into ffn_input buffer) =====
+    float *ffn_input = g_gemma_h;
+    if (pre_ffn_norm_w) {
+        cpu_rms_norm(hidden, pre_ffn_norm_w, ffn_input, hidden_dim, eps);
+    }
+
+    // ===== 10. Dense FFN (GeGLU) — gate, up, down =====
+    memset(g_gemma_ffn_out, 0, hidden_dim * sizeof(float));
+    gemma_dense_ffn(gate_proj_w, up_proj_w, down_proj_w,
+                    ffn_input,
+                    g_gemma_ffn_gate, g_gemma_ffn_up, g_gemma_ffn_out,
+                    GEMMA_DENSE_FFN_HIDDEN, hidden_dim);
+
+    // ===== 11. Combine dense FFN with residual: hidden + (1/sqrt(2)) * ffn_out =====
+    float combine_scale = 0.7071067811865476f; // 1/sqrt(2)
+    for (int i = 0; i < hidden_dim; i++) {
+        hidden[i] = hidden[i] + combine_scale * g_gemma_ffn_out[i];
+    }
+
+    // ===== 12. Post-FFN RMS norm (may be NULL) =====
+    if (post_ffn_norm_w) {
+        cpu_rms_norm(hidden, post_ffn_norm_w, g_gemma_h, hidden_dim, eps);
+        memcpy(hidden, g_gemma_h, hidden_dim * sizeof(float));
+    }
+
+    // ===== 13. Layer scalar (may be NULL) =====
+    if (layer_scalar) {
+        float scalar = bf16_to_f32(layer_scalar[0]);
+        for (int i = 0; i < hidden_dim; i++) {
+            hidden[i] = hidden[i] * scalar;
+        }
+    }
+}
+
 // Top-K: find K largest indices from scores[dim]
 static void cpu_topk(const float *scores, int dim, int K, int *indices, float *values) {
     // Simple selection sort for small K
@@ -4024,16 +4204,6 @@ static void gemma_apply_rope(
 
     free(freqs);
 }
-
-// ============================================================================
-// KV Cache for full attention layers
-// ============================================================================
-
-typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
-    int len;         // current number of cached entries
-} KVCache;
 
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
