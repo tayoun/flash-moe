@@ -109,6 +109,7 @@
 #define GEMMA_HIDDEN_DIM              2816
 #define GEMMA_NUM_LAYERS              30
 #define GEMMA_NUM_EXPERTS             128
+#define GEMMA_TOP_K                   8
 #define GEMMA_NUM_EXPERTS_PER_TOK     8
 #define GEMMA_EXPERT_HIDDEN           704
 #define GEMMA_DENSE_FFN_HIDDEN        2112
@@ -2165,6 +2166,134 @@ static void gemma_dense_ffn(
     }
 }
 
+// ============================================================================
+// Gemma 4 MoE expert slot bank
+// 8-slot bank for top-8 expert routing.
+// load_expert_slot() and slot bank globals are populated by Task 13's
+// expert loading pipeline (async pread + cache lookup).
+// ============================================================================
+
+#define GEMMA_NUM_EXPERT_SLOTS  8
+
+// Expert slot bank: pre-loaded BF16 weights for the currently cached experts.
+// gate_up[slot][2][704][2816]: [0]=gate proj, [1]=up proj
+// down[slot][2816][704]: down proj
+static uint16_t g_expert_bank_gate_up[GEMMA_NUM_EXPERT_SLOTS][2][GEMMA_EXPERT_HIDDEN][GEMMA_HIDDEN_DIM];
+static uint16_t g_expert_bank_down[GEMMA_NUM_EXPERT_SLOTS][GEMMA_HIDDEN_DIM][GEMMA_EXPERT_HIDDEN];
+
+// Per-layer LRU state for slot assignment (8 slots, 128 experts per layer).
+// slot_lru[layer][slot] = expert_id currently cached in that slot (or -1 if empty).
+static int g_slot_lru[GEMMA_NUM_LAYERS][GEMMA_NUM_EXPERT_SLOTS];
+
+// Initialize slot LRU state
+static void init_expert_slot_bank(void) {
+    for (int l = 0; l < GEMMA_NUM_LAYERS; l++) {
+        for (int s = 0; s < GEMMA_NUM_EXPERT_SLOTS; s++) {
+            g_slot_lru[l][s] = -1;  // empty
+        }
+    }
+}
+
+// Simple round-robin slot assignment: maps expert_id → slot.
+// In production Task 13 replaces this with an LRU cache + async pread.
+static int load_expert_slot(int layer_idx, int expert_id) {
+    // Check if expert is already in a slot (LRU hit)
+    for (int s = 0; s < GEMMA_NUM_EXPERT_SLOTS; s++) {
+        if (g_slot_lru[layer_idx][s] == expert_id) {
+            return s;  // cache hit
+        }
+    }
+    // Find a free slot or evict the LRU slot (simple round-robin)
+    static int s_next_slot[GEMMA_NUM_LAYERS] = {0};
+    int slot = s_next_slot[layer_idx] % GEMMA_NUM_EXPERT_SLOTS;
+    s_next_slot[layer_idx]++;
+
+    // In a real implementation, Task 13 would pread the expert from SSD here.
+    // For now, the slot bank is assumed pre-populated by the caller.
+    // Just update the LRU tag.
+    g_slot_lru[layer_idx][slot] = expert_id;
+    return slot;
+}
+
+// Gemma MoE forward: top-8 expert routing + GeGLU + down projection + weighted accum
+// layer_idx: which layer (for expert loading)
+// pre_ffn_hidden: [GEMMA_HIDDEN_DIM=2816] input after pre-FFN RMSNorm
+// top_k_ids[8], top_k_weights[8]: from gemma_router()
+// moe_out: [GEMMA_HIDDEN_DIM] output — weighted sum of expert outputs
+//
+// Algorithm:
+//   for each selected expert:
+//     1. load_expert_slot(layer_idx, expert_id) → slot s
+//     2. gate_up = gate_up[slot] — shape [2, 704, 2816] where [0]=gate, [1]=up
+//     3. matvec: gate_out = gate[704] @ pre_ffn_hidden → intermediate
+//     4. matvec: up_out = up[704] @ pre_ffn_hidden → intermediate (reuse buffer)
+//     5. geglu: intermediate = GeGLU(gate_out, up_out) → [704]
+//     6. matvec: down_out = down[2816] @ intermediate → [2816]
+//     7. moe_out += top_k_weights[i] * down_out
+//
+// NOTE: Caller must zero moe_out before calling this function.
+static void gemma_moe_forward(
+    int layer_idx,
+    const float *pre_ffn_hidden,
+    const int *top_k_ids,
+    const float *top_k_weights,
+    float *moe_out
+) {
+    float intermediate[GEMMA_EXPERT_HIDDEN];  // [704] GeGLU output
+    float down_out[GEMMA_HIDDEN_DIM];         // [2816] down projection output
+
+    for (int i = 0; i < GEMMA_NUM_EXPERTS_PER_TOK; i++) {
+        int expert_id = top_k_ids[i];
+        float weight = top_k_weights[i];
+
+        // Load expert into slot bank
+        int slot = load_expert_slot(layer_idx, expert_id);
+        if (slot < 0) {
+            // Expert not available — skip
+            continue;
+        }
+
+        // Gate projection: intermediate = gate_up[slot][0] @ pre_ffn_hidden
+        // gate_up[slot][0] is [GEMMA_EXPERT_HIDDEN=704, GEMMA_HIDDEN_DIM=2816]
+        for (int r = 0; r < GEMMA_EXPERT_HIDDEN; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < GEMMA_HIDDEN_DIM; c++) {
+                sum += bf16_to_f32(g_expert_bank_gate_up[slot][0][r][c]) * pre_ffn_hidden[c];
+            }
+            intermediate[r] = sum;
+        }
+
+        // Up projection: intermediate[704+i] = gate_up[slot][1] @ pre_ffn_hidden
+        // (we reuse intermediate as the output buffer for up, then call geglu in-place)
+        float up_out[GEMMA_EXPERT_HIDDEN];
+        for (int r = 0; r < GEMMA_EXPERT_HIDDEN; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < GEMMA_HIDDEN_DIM; c++) {
+                sum += bf16_to_f32(g_expert_bank_gate_up[slot][1][r][c]) * pre_ffn_hidden[c];
+            }
+            up_out[r] = sum;
+        }
+
+        // GeGLU: intermediate = GeGLU(gate_out, up_out) — in-place result
+        cpu_geglu(intermediate, up_out, intermediate, GEMMA_EXPERT_HIDDEN);
+
+        // Down projection: down_out = down[slot] @ intermediate
+        // down[slot] is [GEMMA_HIDDEN_DIM=2816, GEMMA_EXPERT_HIDDEN=704]
+        for (int r = 0; r < GEMMA_HIDDEN_DIM; r++) {
+            float sum = 0.0f;
+            for (int c = 0; c < GEMMA_EXPERT_HIDDEN; c++) {
+                sum += bf16_to_f32(g_expert_bank_down[slot][r][c]) * intermediate[c];
+            }
+            down_out[r] = sum;
+        }
+
+        // Weighted accumulate: moe_out += weight * down_out
+        for (int r = 0; r < GEMMA_HIDDEN_DIM; r++) {
+            moe_out[r] += weight * down_out[r];
+        }
+    }
+}
+
 // Forward declaration for cpu_rms_norm_bare (defined later in file)
 static void cpu_rms_norm_bare(const float *x, float *out, int dim, float eps);
 
@@ -2571,6 +2700,99 @@ static void cpu_normalize_weights(float *weights, int K) {
         float inv = 1.0f / sum;
         for (int k = 0; k < K; k++) weights[k] *= inv;
     }
+}
+
+// ============================================================================
+// Gemma 4 MoE Router — selects top-8 experts for a single token
+// Process: RMSNorm(no scale) → scale × 1/√hidden → matvec → softmax → top-8 → per-expert scale → normalize
+// ============================================================================
+
+// Gemma router: selects top-8 experts for a single token
+// hidden: [GEMMA_HIDDEN_DIM] input (after pre-FFN RMSNorm applied)
+// router_w: [GEMMA_NUM_EXPERTS=128, GEMMA_HIDDEN_DIM=2816] BF16
+// per_expert_scale: [GEMMA_NUM_EXPERTS] BF16 — temperature/scale per expert
+// top_k_ids: output [GEMMA_TOP_K=8] — indices of selected experts
+// top_k_weights: output [GEMMA_TOP_K] — normalized weights for each selected expert
+//
+// Gemma routing algorithm:
+//  1. matvec: scores = W_gate @ hidden → [128]
+//  2. softmax: probs = softmax(scores)
+//  3. top-k: select k=8 with largest probs
+//  4. per-expert scale: weight[e] *= per_expert_scale[e]
+//  5. normalize: weight /= sum(weights)
+static void gemma_router(
+    const float *hidden,
+    const uint16_t *router_w,
+    const uint16_t *per_expert_scale,
+    int top_k_ids[GEMMA_TOP_K],
+    float top_k_weights[GEMMA_TOP_K]
+) {
+    const int num_experts = GEMMA_NUM_EXPERTS;  // 128
+    const int top_k = GEMMA_TOP_K;              // 8
+    const int hidden_dim = GEMMA_HIDDEN_DIM;    // 2816
+    const float rscale = 1.0f / sqrtf((float)hidden_dim); // 1/sqrt(2816)
+
+    // Step 1: matvec — scores = (W @ hidden) * (1/sqrt(hidden_dim))
+    float scores[128];
+    for (int e = 0; e < num_experts; e++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden_dim; j++) {
+            sum += bf16_to_f32(router_w[e * hidden_dim + j]) * hidden[j];
+        }
+        scores[e] = sum * rscale;
+    }
+
+    // Step 2: softmax over all 128 experts (numerically stable)
+    float max_score = scores[0];
+    for (int e = 1; e < num_experts; e++) {
+        if (scores[e] > max_score) max_score = scores[e];
+    }
+    float sum_exp = 0.0f;
+    float probs[128];
+    for (int e = 0; e < num_experts; e++) {
+        probs[e] = expf(scores[e] - max_score);
+        sum_exp += probs[e];
+    }
+    float inv_sum = 1.0f / sum_exp;
+    for (int e = 0; e < num_experts; e++) {
+        probs[e] *= inv_sum;
+    }
+
+    // Step 3: top-k selection — find 8 experts with highest probabilities
+    float top_k_scores[8] = {-1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f};
+    int top_k_idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int e = 0; e < num_experts; e++) {
+        if (probs[e] > top_k_scores[top_k - 1]) {
+            // Insert into sorted position (descending by probability)
+            int pos = top_k - 1;
+            while (pos > 0 && probs[e] > top_k_scores[pos - 1]) {
+                top_k_scores[pos] = top_k_scores[pos - 1];
+                top_k_idx[pos] = top_k_idx[pos - 1];
+                pos--;
+            }
+            top_k_scores[pos] = probs[e];
+            top_k_idx[pos] = e;
+        }
+    }
+
+    // Step 4: per-expert scale multiply (temperature)
+    for (int i = 0; i < top_k; i++) {
+        int e = top_k_idx[i];
+        float s = bf16_to_f32(per_expert_scale[e]);
+        top_k_weights[i] = probs[e] * s;
+    }
+
+    // Step 5: normalize weights to sum to 1
+    float sum_w = 0.0f;
+    for (int i = 0; i < top_k; i++) sum_w += top_k_weights[i];
+    if (sum_w > 0.0f) {
+        float inv_sum_w = 1.0f / sum_w;
+        for (int i = 0; i < top_k; i++) top_k_weights[i] *= inv_sum_w;
+    }
+
+    // Output ids
+    for (int i = 0; i < top_k; i++) top_k_ids[i] = top_k_idx[i];
 }
 
 // Element-wise add: dst += src
