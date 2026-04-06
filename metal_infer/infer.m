@@ -1924,6 +1924,74 @@ static void cpu_rms_norm_weighted(
     }
 }
 
+// GeGLU activation: out[i] = gelu(gate[i]) * up[i]
+// gelu approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
+static void cpu_geglu(const float *gate, const float *up, float *out, int dim) {
+    const float sqrt_2_over_pi = 0.7978845608028654f; // sqrt(2/pi)
+    const float coeff = 0.044715f;
+    for (int i = 0; i < dim; i++) {
+        float g = gate[i];
+        float inner = sqrt_2_over_pi * (g + coeff * g * g * g);
+        float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+        out[i] = gelu_g * up[i];
+    }
+}
+
+// Gemma dense FFN forward: gate_proj → GeGLU → up_proj → down_proj
+// gate_w: [intermediate, hidden] BF16
+// up_w: [intermediate, hidden] BF16
+// down_w: [hidden, intermediate] BF16
+// input: [hidden]
+// intermediate: intermediate size (2112 for Gemma)
+// hidden: hidden size (2816 for Gemma)
+// out: [hidden]
+// intermediate_buf must have space for 2 * intermediate elements (gate + up outputs)
+static void gemma_dense_ffn(
+    const uint16_t *gate_w,
+    const uint16_t *up_w,
+    const uint16_t *down_w,
+    const float *input,
+    float *intermediate_buf,
+    float *down_buf,
+    float *out,
+    int intermediate,  // 2112
+    int hidden          // 2816
+) {
+    // Gate projection: intermediate = W_gate @ input
+    for (int i = 0; i < intermediate; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden; j++) {
+            sum += bf16_to_f32(gate_w[i * hidden + j]) * input[j];
+        }
+        intermediate_buf[i] = sum;
+    }
+    
+    // Up projection: up_out = W_up @ input (stored in second half of buffer)
+    float *up_out = intermediate_buf + intermediate;
+    for (int i = 0; i < intermediate; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden; j++) {
+            sum += bf16_to_f32(up_w[i * hidden + j]) * input[j];
+        }
+        up_out[i] = sum;
+    }
+    
+    // GeGLU: in-place on gate half, result in intermediate_buf
+    cpu_geglu(intermediate_buf, up_out, intermediate_buf, intermediate);
+    
+    // Down projection: out = W_down @ intermediate_buf
+    for (int i = 0; i < hidden; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < intermediate; j++) {
+            sum += bf16_to_f32(down_w[i * intermediate + j]) * intermediate_buf[j];
+        }
+        out[i] = sum;
+    }
+}
+
+// Forward declaration for cpu_rms_norm_bare (defined later in file)
+static void cpu_rms_norm_bare(const float *x, float *out, int dim, float eps);
+
 // Gemma Q projection: BF16 matvec then per-head Q norm with learned weight
 // q_w: [q_dim, GEMMA_HIDDEN_DIM] BF16 where q_dim = num_q_heads * head_dim
 // input: [GEMMA_HIDDEN_DIM], normed: [GEMMA_HIDDEN_DIM]
@@ -3884,6 +3952,78 @@ static void kv_cache_free(KVCache *c) {
         free(c->v_cache);
         free(c);
     }
+}
+
+// ============================================================================
+// Gemma KV cache — per-layer geometry and store/load
+// Sliding attention layers: head_dim=256, 8 KV heads
+// Full attention layers:   head_dim=512, 2 KV heads
+// KV cache layout: [max_len, num_kv_heads, head_dim] — contiguous per position
+// GQA: each Q head group attends to one KV head
+// ============================================================================
+
+// Compute the total KV cache size needed for one Gemma layer
+// Returns: num_kv_heads * head_dim * max_len * sizeof(float)
+static size_t gemma_kv_cache_size_per_layer(int layer_idx, int max_len) {
+    int head_dim = gemma_head_dim(layer_idx);
+    int num_kv = gemma_num_kv_heads(layer_idx);
+    return (size_t)max_len * num_kv * head_dim * sizeof(float);
+}
+
+// Compute total KV cache size across all Gemma layers
+// max_len: maximum sequence length (e.g., 4096 or 32768)
+static size_t gemma_total_kv_cache_size(int num_layers, int max_len) {
+    size_t total = 0;
+    for (int i = 0; i < num_layers; i++) {
+        total += gemma_kv_cache_size_per_layer(i, max_len);
+    }
+    return total;
+}
+
+// Store K and V into the KV cache at position `pos` for a given layer
+// k_in: [num_kv_heads, head_dim], v_in: [num_kv_heads, head_dim]
+// kv_cache_k: [max_len, num_kv_heads, head_dim], kv_cache_v: same layout
+// For full attention with K=V sharing: v_in pointer may equal k_in pointer
+static void gemma_kv_cache_store(
+    float *kv_cache_k,
+    float *kv_cache_v,
+    const float *k_in,
+    const float *v_in,
+    int num_kv_heads,
+    int head_dim,
+    int max_len,
+    int pos
+) {
+    size_t kv_size = (size_t)num_kv_heads * head_dim;
+    float *k_dst = kv_cache_k + (size_t)pos * kv_size;
+    float *v_dst = kv_cache_v + (size_t)pos * kv_size;
+    memcpy(k_dst, k_in, kv_size * sizeof(float));
+    // For K=V sharing, v_in == k_in and memcpy above already copied K as V
+    // For separate V: copy V as well
+    if (v_in != k_in) {
+        memcpy(v_dst, v_in, kv_size * sizeof(float));
+    }
+}
+
+// Load K and V from the KV cache for attention computation
+// Returns pointer into the cache at position `pos`
+// k_out: [num_kv_heads, head_dim], v_out: [num_kv_heads, head_dim]
+// kv_cache_k: [max_len, num_kv_heads, head_dim]
+static void gemma_kv_cache_load(
+    float *k_out,
+    float *v_out,
+    const float *kv_cache_k,
+    const float *kv_cache_v,
+    int num_kv_heads,
+    int head_dim,
+    int max_len,
+    int pos
+) {
+    size_t kv_size = (size_t)num_kv_heads * head_dim;
+    const float *k_src = kv_cache_k + (size_t)pos * kv_size;
+    const float *v_src = kv_cache_v + (size_t)pos * kv_size;
+    memcpy(k_out, k_src, kv_size * sizeof(float));
+    memcpy(v_out, v_src, kv_size * sizeof(float));
 }
 
 // ============================================================================
