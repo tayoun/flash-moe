@@ -257,11 +257,12 @@ def _pack_all_layers(expert_index, model_path, output_dir):
                 needed_files[fpath] = fd
 
     def make_header():
+        # Format string: <4s I I I Q Q Q 32s = 8 items (magic, version, num_experts, expert_hidden, hidden_size, gate_up_bytes, down_bytes, reserved)
         return struct.pack(
-            '<4s III QQ 32s',
+            '<4s I I I Q Q Q 32s',
             b'GEMM',          # magic
             1,                # version
-            num_experts,      # num_experts
+            int(num_experts),  # num_experts
             GEMMA4_EXPERT_HIDDEN,  # expert_hidden
             GEMMA4_HIDDEN_SIZE,    # hidden_size
             GEMMA4_GATE_UP_BYTES_PER_EXPERT,
