@@ -199,6 +199,12 @@ static GemmaConfig g_gemma_config = {0};
 
 // Forward declarations (defined later)
 static void init_expert_bank(void);
+static void expert_bank_note_load(int hit);
+static void oracle_record(int layer_idx, const int *top_k_ids, const float *top_k_weights);
+static int oracle_try_prefetch(int layer_idx, const int *top_k_ids);
+static void expert_prefetch_start(int layer_idx, const int *top_k_ids);
+static void expert_prefetch_init(void);
+static void expert_prefetch_shutdown(void);
 static void gemma_router(const float *hidden, const uint16_t *router_w,
                          const uint16_t *per_expert_scale,
                          int top_k_ids[8], float top_k_weights[8]);
@@ -531,6 +537,7 @@ static int load_expert_slot(int layer_idx, int expert_id) {
     for (int s = 0; s < GEMMA_EXPERT_BANK_SIZE; s++) {
         if (g_expert_bank_valid[s] && g_expert_bank_id[s] == expert_id) {
             g_expert_bank_lru[s]++;  // bump LRU
+            expert_bank_note_load(1);  // hit
             return s;
         }
     }
@@ -583,6 +590,7 @@ static int load_expert_slot(int layer_idx, int expert_id) {
     g_expert_bank_valid[evict_slot] = 1;
     g_expert_bank_id[evict_slot] = expert_id;
     g_expert_bank_lru[evict_slot]++;  // bump LRU
+    expert_bank_note_load(0);  // miss
 
     return evict_slot;
 }
@@ -616,6 +624,125 @@ static int preload_expert_slot(int slot, int layer_idx, int expert_id) {
     // Don't update LRU for prefetch
 
     return 0;
+}
+
+// ============================================================================
+// Expert slot bank telemetry — miss vs hit tracking
+// ============================================================================
+
+static uint64_t g_expert_loads_total = 0;
+static uint64_t g_expert_loads_miss = 0;   // Not in bank, loaded from SSD
+static uint64_t g_expert_loads_hit = 0;    // Already in bank
+
+static void expert_bank_note_load(int hit) {
+    g_expert_loads_total++;
+    if (hit) g_expert_loads_hit++;
+    else g_expert_loads_miss++;
+}
+
+// ============================================================================
+// Oracle prefetch — record top-k per token, prefetch on repeat selection
+// ============================================================================
+
+// Oracle: record top-k expert IDs selected for each token
+// For replay: if next token selects same experts, they're already loaded
+#define ORACLE_WINDOW 4  // remember last 4 tokens' expert selections
+
+static int g_oracle_ids[ORACLE_WINDOW][GEMMA_TOP_K];          // expert IDs per token
+static float g_oracle_weights[ORACLE_WINDOW][GEMMA_TOP_K];    // weights per token
+static int g_oracle_head = 0;    // circular buffer index
+static int g_oracle_count = 0;   // tokens seen so far
+
+static void oracle_record(int layer_idx, const int *top_k_ids, const float *top_k_weights) {
+    (void)layer_idx;
+    int slot = g_oracle_head % ORACLE_WINDOW;
+    for (int i = 0; i < GEMMA_TOP_K; i++) {
+        g_oracle_ids[slot][i] = top_k_ids[i];
+        g_oracle_weights[slot][i] = top_k_weights[i];
+    }
+    g_oracle_head++;
+    g_oracle_count++;
+}
+
+// Oracle prefetch: check if current token's experts match recent history
+// Returns 1 if experts were prefetched, 0 otherwise
+static int oracle_try_prefetch(int layer_idx, const int *top_k_ids) {
+    (void)layer_idx;
+    if (g_oracle_count == 0) return 0;
+
+    // Check the most recent token's selection
+    int prev_slot = (g_oracle_head - 1 + ORACLE_WINDOW) % ORACLE_WINDOW;
+    int match_count = 0;
+    for (int i = 0; i < GEMMA_TOP_K; i++) {
+        if (g_oracle_ids[prev_slot][i] == top_k_ids[i]) match_count++;
+    }
+
+    // If all top-k match, prefetch them for next token
+    if (match_count == GEMMA_TOP_K) {
+        // Prefetch into slots 0..GEMMA_TOP_K-1 without LRU bump
+        for (int i = 0; i < GEMMA_TOP_K; i++) {
+            preload_expert_slot(i, layer_idx, top_k_ids[i]);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Background prefetch thread — non-blocking expert loading
+// ============================================================================
+
+static int g_prefetch_thread_running = 0;
+static pthread_t g_prefetch_thread;
+
+// Prefetch request queue (simple: just the next layer's experts)
+static int g_prefetch_req_layer = -1;
+static int g_prefetch_req_ids[GEMMA_TOP_K];
+static pthread_mutex_t g_prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_prefetch_cond = PTHREAD_COND_INITIALIZER;
+
+static void *prefetch_thread_fn(void *arg) {
+    (void)arg;
+    while (g_prefetch_thread_running) {
+        pthread_mutex_lock(&g_prefetch_mutex);
+        while (g_prefetch_req_layer < 0 && g_prefetch_thread_running) {
+            pthread_cond_wait(&g_prefetch_cond, &g_prefetch_mutex);
+        }
+        if (!g_prefetch_thread_running) {
+            pthread_mutex_unlock(&g_prefetch_mutex);
+            break;
+        }
+        int layer = g_prefetch_req_layer;
+        int ids[GEMMA_TOP_K];
+        for (int i = 0; i < GEMMA_TOP_K; i++) ids[i] = g_prefetch_req_ids[i];
+        g_prefetch_req_layer = -1;  // clear request
+        pthread_mutex_unlock(&g_prefetch_mutex);
+
+        // Prefetch all GEMMA_TOP_K experts
+        for (int i = 0; i < GEMMA_TOP_K; i++) {
+            preload_expert_slot(i, layer, ids[i]);
+        }
+    }
+    return NULL;
+}
+
+static void expert_prefetch_start(int layer_idx, const int *top_k_ids) {
+    pthread_mutex_lock(&g_prefetch_mutex);
+    g_prefetch_req_layer = layer_idx;
+    for (int i = 0; i < GEMMA_TOP_K; i++) g_prefetch_req_ids[i] = top_k_ids[i];
+    pthread_cond_signal(&g_prefetch_cond);
+    pthread_mutex_unlock(&g_prefetch_mutex);
+}
+
+static void expert_prefetch_init(void) {
+    g_prefetch_thread_running = 1;
+    pthread_create(&g_prefetch_thread, NULL, prefetch_thread_fn, NULL);
+}
+
+static void expert_prefetch_shutdown(void) {
+    g_prefetch_thread_running = 0;
+    pthread_cond_signal(&g_prefetch_cond);
+    pthread_join(g_prefetch_thread, NULL);
 }
 
 typedef enum {
@@ -2633,6 +2760,13 @@ static void gemma_layer_forward(
     int moe_ids[GEMMA_TOP_K];
     float moe_weights[GEMMA_TOP_K];
     gemma_router(ffn_input, router_w, per_expert_scale, moe_ids, moe_weights);
+
+    // Record for oracle replay
+    oracle_record(layer_idx, moe_ids, moe_weights);
+    // Try oracle prefetch for next token
+    oracle_try_prefetch(layer_idx, moe_ids);
+    // Background prefetch (non-blocking)
+    expert_prefetch_start(layer_idx, moe_ids);
 
     // ===== 11. MoE expert forward — route to top-K experts, weighted output =====
     float moe_out[GEMMA_HIDDEN_DIM] = {0};
@@ -5638,6 +5772,16 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 
     // Full matmul — use GPU if available (248320 output rows!)
     fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+}
+
+// Gemma final logit softcapping
+// Gemma uses: logits = tanh(logits / 30.0) * 30.0
+// This is applied AFTER lm_head_forward and BEFORE sampling
+// This is Gemma-specific; Qwen does NOT use softcapping
+static void gemma_logit_softcap(float *logits, int vocab_size, float cap) {
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = tanhf(logits[i] / cap) * cap;
+    }
 }
 
 // ============================================================================
@@ -9236,6 +9380,9 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
+            if (cfg_is_gemma()) {
+                gemma_logit_softcap(logits, VOCAB_SIZE, GEMMA_FINAL_LOGIT_SOFTCA);
+            }
             int next_token = cpu_argmax(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
@@ -9317,6 +9464,9 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
+                if (cfg_is_gemma()) {
+                    gemma_logit_softcap(logits, VOCAB_SIZE, GEMMA_FINAL_LOGIT_SOFTCA);
+                }
                 next_token = cpu_argmax(logits, VOCAB_SIZE);
             }
 
@@ -9571,6 +9721,9 @@ int main(int argc, char **argv) {
         if (!g_metal) {
             fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
         }
+
+        // ---- Initialize expert background prefetch thread ----
+        expert_prefetch_init();
 
         // ---- Initialize persistent I/O thread pool ----
         io_pool_init();
@@ -9950,6 +10103,7 @@ int main(int argc, char **argv) {
                        hidden, logits, final_norm_w, K);
             // serve_loop never returns, but cleanup just in case
             free(hidden); free(logits);
+            expert_prefetch_shutdown();
             return 0;
         }
 
@@ -10034,6 +10188,7 @@ int main(int argc, char **argv) {
             free(gt->ids); free(gt);
             free(hidden); free(logits);
             io_pool_shutdown();
+            expert_prefetch_shutdown();
             return 0;
         }
 
@@ -10142,6 +10297,9 @@ int main(int argc, char **argv) {
         // ---- LM head ----
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
+        if (cfg_is_gemma()) {
+            gemma_logit_softcap(logits, VOCAB_SIZE, GEMMA_FINAL_LOGIT_SOFTCA);
+        }
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
@@ -10228,6 +10386,9 @@ int main(int argc, char **argv) {
             // LM head
             double t_lm_gen = now_ms();
             lm_head_forward(wf, hidden, logits);
+            if (cfg_is_gemma()) {
+                gemma_logit_softcap(logits, VOCAB_SIZE, GEMMA_FINAL_LOGIT_SOFTCA);
+            }
             double lm_gen_ms = now_ms() - t_lm_gen;
             if (g_timing_enabled) {
                 g_timing.lm_head += lm_gen_ms;
@@ -10311,6 +10472,7 @@ int main(int argc, char **argv) {
 
         // ---- Cleanup ----
         io_pool_shutdown();
+        expert_prefetch_shutdown();
         if (g_malloc_cache) {
             malloc_cache_free(g_malloc_cache);
             g_malloc_cache = NULL;
