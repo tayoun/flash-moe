@@ -220,6 +220,8 @@ static float *g_gemma_ffn_up = NULL;   // [GEMMA_DENSE_FFN_HIDDEN] up projection
 static float *g_gemma_ffn_out = NULL;  // [GEMMA_HIDDEN_DIM] FFN output
 static int g_gemma_scratch_inited = 0;
 
+// Gemma KV caches declaration (KVCache defined below after line 248)
+
 static void init_gemma_scratch(void) {
     if (g_gemma_scratch_inited) return;
     g_gemma_h = calloc(GEMMA_HIDDEN_DIM, sizeof(float));
@@ -241,6 +243,9 @@ typedef struct {
     float *v_cache;
     int len;  // current number of cached entries
 } KVCache;
+
+// Gemma KV caches — one per layer, each with layer-specific geometry
+static KVCache **g_gemma_kv_caches = NULL;
 
 // Gemma 4 26B-A4B uses hybrid attention:
 //   Full attention layers: 5, 11, 17, 23, 29  (every 6th layer, starting at 5)
@@ -4790,6 +4795,41 @@ static void gemma_kv_cache_load(
 }
 
 // ============================================================================
+// Gemma KV cache allocation — per-layer geometry
+// Sliding attention layers: head_dim=256, 8 KV heads
+// Full attention layers:   head_dim=512, 2 KV heads
+// ============================================================================
+
+// Create a KV cache for a specific Gemma layer with correct geometry
+static KVCache *gemma_kv_cache_new_for_layer(int layer_idx, int max_len) {
+    int head_dim = gemma_head_dim(layer_idx);
+    int num_kv = gemma_num_kv_heads(layer_idx);
+    KVCache *c = calloc(1, sizeof(KVCache));
+    c->k_cache = calloc((size_t)max_len * num_kv * head_dim, sizeof(float));
+    c->v_cache = calloc((size_t)max_len * num_kv * head_dim, sizeof(float));
+    c->len = 0;
+    return c;
+}
+
+// Allocate all Gemma KV caches for all layers
+static KVCache **gemma_kv_caches_new(int num_layers, int max_len) {
+    KVCache **caches = calloc(num_layers, sizeof(KVCache *));
+    for (int i = 0; i < num_layers; i++) {
+        caches[i] = gemma_kv_cache_new_for_layer(i, max_len);
+    }
+    return caches;
+}
+
+// Free all Gemma KV caches
+static void gemma_kv_caches_free(KVCache **caches, int num_layers) {
+    if (!caches) return;
+    for (int i = 0; i < num_layers; i++) {
+        kv_cache_free(caches[i]);
+    }
+    free(caches);
+}
+
+// ============================================================================
 // Linear attention state (GatedDeltaNet recurrent state)
 // ============================================================================
 
@@ -6764,6 +6804,116 @@ static void build_layer_cache(WeightFile *wf) {
 
     layer_cache_built = 1;
     printf("[cache] Pre-computed weight pointers for %d layers\n", NUM_LAYERS);
+}
+
+// ============================================================================
+// Gemma layer weight cache — bind all per-layer weight pointers for Gemma 4
+// ============================================================================
+
+// Gemma layer weight cache — one entry per Gemma layer (0-29)
+typedef struct {
+    const uint16_t *input_norm_w;           // [2816] BF16 — input layernorm
+    const uint16_t *q_proj_w;                // [q_dim, 2816] BF16
+    const uint16_t *k_proj_w;                // [kv_dim, 2816] BF16
+    const uint16_t *v_proj_w;                // [kv_dim, 2816] BF16 (same as k for K=V)
+    const uint16_t *q_norm_w;                // [num_q_heads, head_dim] BF16
+    const uint16_t *k_norm_w;                // [num_kv_heads, head_dim] BF16
+    const uint16_t *v_norm_w;                // [num_kv_heads, head_dim] BF16
+    const uint16_t *o_proj_w;                // [2816, q_dim] BF16
+    const uint16_t *post_attn_norm_w;        // [2816] BF16 — post attention RMSNorm
+    const uint16_t *pre_ffn_norm_w;          // [2816] BF16 — pre-FFN RMSNorm
+    const uint16_t *gate_proj_w;            // [2112, 2816] BF16
+    const uint16_t *up_proj_w;               // [2112, 2816] BF16
+    const uint16_t *down_proj_w;             // [2816, 2112] BF16
+    const uint16_t *post_ffn_norm_w;         // [2816] BF16 — post-FFN RMSNorm
+    const uint16_t *layer_scalar;            // [1] BF16
+    const uint16_t *router_w;                // [128, 2816] BF16 router projection
+    const uint16_t *per_expert_scale;       // [128] BF16 per-expert temperature
+} GemmaLayerWeightCache;
+
+static GemmaLayerWeightCache g_gemma_layer_cache[GEMMA_NUM_LAYERS];
+static int g_gemma_layer_cache_built = 0;
+
+// Build the Gemma layer weight cache from model_weights.bin
+// Tensor names from model_weights.json manifest:
+//   layers.N.input_layernorm.weight      → input_norm_w
+//   layers.N.self_attn.q_proj.weight     → q_proj_w
+//   layers.N.self_attn.k_proj.weight     → k_proj_w
+//   layers.N.self_attn.v_proj.weight     → v_proj_w
+//   layers.N.self_attn.o_proj.weight     → o_proj_w
+//   layers.N.self_attn.q_norm.weight     → q_norm_w
+//   layers.N.self_attn.k_norm.weight     → k_norm_w
+//   layers.N.self_attn.v_norm.weight     → v_norm_w
+//   layers.N.post_attention_layernorm.weight → post_attn_norm_w
+//   layers.N.pre_feedforward_layernorm.weight → pre_ffn_norm_w
+//   layers.N.mlp.gate_proj.weight        → gate_proj_w
+//   layers.N.mlp.up_proj.weight          → up_proj_w
+//   layers.N.mlp.down_proj.weight        → down_proj_w
+//   layers.N.post_feedforward_layernorm.weight → post_ffn_norm_w
+//   layers.N.layer_scalar                → layer_scalar
+//   layers.N.router.proj.weight           → router_w
+//   layers.N.router.per_expert_scale     → per_expert_scale
+static void build_gemma_layer_cache(WeightFile *wf) {
+    if (g_gemma_layer_cache_built) return;
+    char name[512];
+
+    for (int i = 0; i < GEMMA_NUM_LAYERS; i++) {
+        GemmaLayerWeightCache *lc = &g_gemma_layer_cache[i];
+
+        snprintf(name, sizeof(name), "layers.%d.input_layernorm.weight", i);
+        lc->input_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.q_proj.weight", i);
+        lc->q_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.k_proj.weight", i);
+        lc->k_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.v_proj.weight", i);
+        lc->v_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.o_proj.weight", i);
+        lc->o_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.q_norm.weight", i);
+        lc->q_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.k_norm.weight", i);
+        lc->k_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.self_attn.v_norm.weight", i);
+        lc->v_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.post_attention_layernorm.weight", i);
+        lc->post_attn_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.pre_feedforward_layernorm.weight", i);
+        lc->pre_ffn_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.mlp.gate_proj.weight", i);
+        lc->gate_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.mlp.up_proj.weight", i);
+        lc->up_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.mlp.down_proj.weight", i);
+        lc->down_proj_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.post_feedforward_layernorm.weight", i);
+        lc->post_ffn_norm_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.layer_scalar", i);
+        lc->layer_scalar = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.router.proj.weight", i);
+        lc->router_w = get_tensor_ptr(wf, name);
+
+        snprintf(name, sizeof(name), "layers.%d.router.per_expert_scale", i);
+        lc->per_expert_scale = get_tensor_ptr(wf, name);
+    }
+
+    g_gemma_layer_cache_built = 1;
+    printf("[cache] Gemma layer weight cache bound for %d layers\n", GEMMA_NUM_LAYERS);
 }
 
 // ============================================================================
@@ -9034,16 +9184,29 @@ static void serve_loop(
             } else {
                 embed_lookup(wf, sys_pt->ids[i], hidden);
             }
-            for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    sys_pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
+            if (cfg_is_gemma()) {
+                for (int layer = 0; layer < GEMMA_NUM_LAYERS; layer++) {
+                    GemmaLayerWeightCache *lc = &g_gemma_layer_cache[layer];
+                    gemma_layer_forward(
+                        hidden, g_gemma_kv_caches[layer], layer, sys_pos,
+                        lc->input_norm_w, lc->q_proj_w, lc->k_proj_w, lc->v_proj_w,
+                        lc->q_norm_w, lc->k_norm_w, lc->v_norm_w, lc->o_proj_w,
+                        lc->post_attn_norm_w, lc->pre_ffn_norm_w,
+                        lc->gate_proj_w, lc->up_proj_w, lc->down_proj_w, lc->post_ffn_norm_w,
+                        lc->layer_scalar, lc->router_w, lc->per_expert_scale);
+                }
+            } else {
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        sys_pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                discard_deferred_experts();
             }
-            discard_deferred_experts();
             sys_pos++;
         }
         // Last system prompt token: full completion
@@ -9055,16 +9218,29 @@ static void serve_loop(
             } else {
                 embed_lookup(wf, sys_pt->ids[0], hidden);
             }
-            for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
-                                    sys_pos,
-                                    layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                    K, layer_fds[layer]);
+            if (cfg_is_gemma()) {
+                for (int layer = 0; layer < GEMMA_NUM_LAYERS; layer++) {
+                    GemmaLayerWeightCache *lc = &g_gemma_layer_cache[layer];
+                    gemma_layer_forward(
+                        hidden, g_gemma_kv_caches[layer], layer, sys_pos,
+                        lc->input_norm_w, lc->q_proj_w, lc->k_proj_w, lc->v_proj_w,
+                        lc->q_norm_w, lc->k_norm_w, lc->v_norm_w, lc->o_proj_w,
+                        lc->post_attn_norm_w, lc->pre_ffn_norm_w,
+                        lc->gate_proj_w, lc->up_proj_w, lc->down_proj_w, lc->post_ffn_norm_w,
+                        lc->layer_scalar, lc->router_w, lc->per_expert_scale);
+                }
+            } else {
+                for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        sys_pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
             }
-            complete_deferred_experts();
             sys_pos++;
         }
         if (sys_embed_batch) { free(sys_embed_batch); sys_embed_batch = NULL; }
@@ -9334,16 +9510,29 @@ static void serve_loop(
                 } else {
                     embed_lookup(wf, pt->ids[i], hidden);
                 }
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                if (cfg_is_gemma()) {
+                    for (int layer = 0; layer < GEMMA_NUM_LAYERS; layer++) {
+                        GemmaLayerWeightCache *lc = &g_gemma_layer_cache[layer];
+                        gemma_layer_forward(
+                            hidden, g_gemma_kv_caches[layer], layer, pos,
+                            lc->input_norm_w, lc->q_proj_w, lc->k_proj_w, lc->v_proj_w,
+                            lc->q_norm_w, lc->k_norm_w, lc->v_norm_w, lc->o_proj_w,
+                            lc->post_attn_norm_w, lc->pre_ffn_norm_w,
+                            lc->gate_proj_w, lc->up_proj_w, lc->down_proj_w, lc->post_ffn_norm_w,
+                            lc->layer_scalar, lc->router_w, lc->per_expert_scale);
+                    }
+                } else {
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
                 }
-                discard_deferred_experts();
                 pos++;
             }
             // Last prefill token: full completion (need hidden for logits)
@@ -9355,16 +9544,29 @@ static void serve_loop(
                 } else {
                     embed_lookup(wf, pt->ids[0], hidden);
                 }
-                for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(wf, layer, hidden,
-                                        is_full ? kv_caches[layer] : NULL,
-                                        is_full ? NULL : layer_states[layer],
-                                        pos,
-                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                if (cfg_is_gemma()) {
+                    for (int layer = 0; layer < GEMMA_NUM_LAYERS; layer++) {
+                        GemmaLayerWeightCache *lc = &g_gemma_layer_cache[layer];
+                        gemma_layer_forward(
+                            hidden, g_gemma_kv_caches[layer], layer, pos,
+                            lc->input_norm_w, lc->q_proj_w, lc->k_proj_w, lc->v_proj_w,
+                            lc->q_norm_w, lc->k_norm_w, lc->v_norm_w, lc->o_proj_w,
+                            lc->post_attn_norm_w, lc->pre_ffn_norm_w,
+                            lc->gate_proj_w, lc->up_proj_w, lc->down_proj_w, lc->post_ffn_norm_w,
+                            lc->layer_scalar, lc->router_w, lc->per_expert_scale);
+                    }
+                } else {
+                    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        fused_layer_forward(wf, layer, hidden,
+                                            is_full ? kv_caches[layer] : NULL,
+                                            is_full ? NULL : layer_states[layer],
+                                            pos,
+                                            layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                            K, layer_fds[layer]);
+                    }
+                    complete_deferred_experts();
                 }
-                complete_deferred_experts();
                 pos++;
             }
             if (serve_embed_batch) { free(serve_embed_batch); serve_embed_batch = NULL; }
@@ -9834,6 +10036,16 @@ int main(int argc, char **argv) {
         if (gguf_lm_head_path && !attach_gguf_lm_head(wf, gguf_lm_head_path)) {
             fprintf(stderr, "ERROR: Failed to attach GGUF LM head\n");
             return 1;
+        }
+
+        // ---- Gemma model initialization ----
+        if (cfg_is_gemma()) {
+            build_gemma_layer_cache(wf);
+            // Allocate Gemma KV caches: each layer has different head_dim and num_kv
+            // MAX_SEQ_LEN is the maximum sequence length for the KV cache
+            g_gemma_kv_caches = gemma_kv_caches_new(GEMMA_NUM_LAYERS, MAX_SEQ_LEN);
+            printf("[gemma] KV caches allocated for %d layers (MAX_SEQ_LEN=%d)\n",
+                   GEMMA_NUM_LAYERS, MAX_SEQ_LEN);
         }
 
         // Wrap weight file for Metal GPU access
