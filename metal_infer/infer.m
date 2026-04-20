@@ -71,7 +71,6 @@
 
 // Expert offload SSD staging buffer
 #include "expert_offload.h"
-#import "SlotBank.h"
 
 // ============================================================================
 // Runtime model configuration (populated from HuggingFace config.json)
@@ -397,6 +396,24 @@ static void load_model_config(const char *model_dir) {
     fprintf(stderr, "], think: %d/%d\n", cfg.think_start_token, cfg.think_end_token);
 }
 
+static int is_eos_token(int tok) {
+    for (int i = 0; i < cfg.num_eos_tokens; i++) {
+        if (tok == cfg.eos_token_ids[i]) return 1;
+    }
+    return 0;
+}
+
+static int is_think_token(int tok) {
+    return tok == cfg.think_start_token || tok == cfg.think_end_token;
+}
+
+static int should_emit_visible_token(int tok, int in_think) {
+    if (tok < 0) return 0;
+    if (is_think_token(tok)) return 0;
+    if (in_think) return 0;
+    return 1;
+}
+
 // ============================================================================
 // Dynamic tracking arrays (allocated after config is loaded)
 // Declarations here, alloc_tracking_arrays() defined after types below.
@@ -479,9 +496,6 @@ static uint64_t g_pred_layers = 0;
 // Expert offload SSD staging buffer
 static int g_offload_enabled = 0;       // --offload-ssd flag
 static char *g_offload_ssd_path = NULL;  // path to packed_experts_ssd.bin or dir
-static char *g_experts_dir = NULL;
-static int g_slot_bank_size = 32;
-static SlotBank *g_slot_bank = nil;
 
 // Packed sequential SSD mode (single .bin file, all experts concatenated)
 static int g_packed_ssd_mode = 0;
@@ -560,7 +574,6 @@ static inline void expert_mark_seen(int layer, int expert) {
 // g_nocache_mode=1: always cold fd (F_NOCACHE — best for 122B where experts >> RAM)
 // g_nocache_mode=2: tiered — cold for first read, warm for repeats
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
-    if (g_experts_dir && !g_packed_ssd_mode) return -1;
     if (g_packed_ssd_mode) return g_packed_ssd_fd;  // single fd for packed .bin
     if (g_nocache_mode == 0) return warm_fd;
     if (g_nocache_mode == 1) {
@@ -655,7 +668,6 @@ static inline int expert_physical_pos(int layer, int expert_id) {
 // Compute file offset for an expert, accounting for permutation
 // In packed SSD mode: header(16) + (layer * num_experts + expert) * expert_size
 static inline off_t expert_file_offset(int layer, int expert_id, size_t esz) {
-    if (g_experts_dir && !g_packed_ssd_mode) return 0;
     if (g_packed_ssd_mode) {
         return 16 + (off_t)layer * g_packed_num_experts * g_packed_expert_size
                + (off_t)expert_id * g_packed_expert_size;
@@ -1574,6 +1586,7 @@ static float g_sampling_temperature = 0.6f;
 static int g_sampling_top_k = 20;
 static float g_sampling_top_p = 0.95f;
 static int g_use_sampling = 0;  // 0 = greedy, 1 = sampling
+static int g_allow_thinking = 0;  // 0 = suppress <think> in CLI inference by default
 
 // Compare function for qsort (descending order)
 static int cmp_idx_val_desc(const void *a, const void *b) {
@@ -1862,7 +1875,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3_tg128 = makePipe(@"dequant_matvec_4bit_v3_tg128");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit_qwen");  // Fixed for Qwen3.5-MoE
+    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -3238,7 +3251,7 @@ static void full_attention_forward(
     int pos              // position in sequence
 ) {
     fa_debug_count++;
-    int do_debug = 0;  // set to (fa_debug_count <= N) to enable debug
+    int do_debug = 0;
 
     char name[256];
     float *normed = malloc(cfg.hidden_dim * sizeof(float));
@@ -3481,7 +3494,7 @@ static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w
 }
 
 static int linear_attn_bypass = 0;  // set to 1 to skip linear attention (identity)
-static int gpu_linear_attn_enabled = 1;  // fused GPU delta-net path (can disable via --cpu-linear)
+static int gpu_linear_attn_enabled = 0;  // forced off for debugging
 
 __attribute__((unused))
 static void linear_attention_forward(
@@ -3496,9 +3509,7 @@ static void linear_attention_forward(
         return;
     }
 
-    static int la_debug_count = 0;
-    la_debug_count++;
-    int la_debug = 0;  // set to (la_debug_count <= N) to enable debug
+    int la_debug = (layer_idx < 6);
 
     if (la_debug) {
         fprintf(stderr, "[LA-DBG] layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -3562,6 +3573,11 @@ static void linear_attention_forward(
         };
         fast_batch_matvec(normed, cfg.hidden_dim, la_specs, 4);
     }
+    if (la_debug) {
+        fprintf(stderr, "[LA-DBG] layer=%d normed_rms=%.6f qkv_rms=%.6f z_rms=%.6f beta_rms=%.6f alpha_rms=%.6f\n",
+                layer_idx, vec_rms(normed, cfg.hidden_dim), vec_rms(qkv, qkv_dim), vec_rms(z, z_dim),
+                vec_rms(beta, cfg.linear_num_v_heads), vec_rms(alpha, cfg.linear_num_v_heads));
+    }
 
     // ---- Conv1d step ----
     // conv_state holds last (kernel_size-1) inputs for each of the conv_dim channels
@@ -3572,6 +3588,9 @@ static void linear_attention_forward(
     if (conv_w) {
         cpu_conv1d_step(state->conv_state, qkv, conv_w, conv_out,
                         qkv_dim, cfg.conv_kernel_size);
+    }
+    if (la_debug) {
+        fprintf(stderr, "[LA-DBG] layer=%d conv_out_rms=%.6f\n", layer_idx, vec_rms(conv_out, qkv_dim));
     }
 
     // Update conv state: shift left, append new input
@@ -3606,6 +3625,10 @@ static void linear_attention_forward(
         float *kh = lin_k + h * cfg.linear_key_dim;
         cpu_rms_norm_bare(kh, kh, cfg.linear_key_dim, 1e-6f);
         for (int d = 0; d < cfg.linear_key_dim; d++) kh[d] *= inv_scale;
+    }
+    if (la_debug) {
+        fprintf(stderr, "[LA-DBG] layer=%d lin_q_rms=%.6f lin_k_rms=%.6f lin_v_rms=%.6f\n",
+                layer_idx, vec_rms(lin_q, cfg.linear_total_key), vec_rms(lin_k, cfg.linear_total_key), vec_rms(lin_v, cfg.linear_total_value));
     }
 
     // ---- Gated delta net recurrence ----
@@ -3644,6 +3667,10 @@ static void linear_attention_forward(
         beta_gate[vh] = cpu_sigmoid(beta[vh]);
     }
 
+    if (la_debug) {
+        float g0 = g_decay[0], b0 = beta_gate[0];
+        fprintf(stderr, "[LA-DBG] layer=%d g0=%.6f beta0=%.6f\n", layer_idx, g0, b0);
+    }
     for (int vh = 0; vh < cfg.linear_num_v_heads; vh++) {
         int kh = vh / k_heads_per_v;  // which k head this v head maps to
 
@@ -3758,7 +3785,7 @@ static void moe_forward(
 ) {
     moe_debug_count++;
     int moe_debug = 0;  // set to (moe_debug_count <= N) to enable debug
-    int moe_dump = 0;
+    int moe_dump = (layer_idx == 0);
 
     char name[256];
     float *h_post = malloc(cfg.hidden_dim * sizeof(float));
@@ -5284,6 +5311,11 @@ static void finalize_deferred_experts(void) {
 
         // Apply shared expert gate
         float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
+        if (g_deferred.layer_idx == 0) {
+            fprintf(stderr, "[MOE-GPU] layer=0 moe_out_rms=%.6f shared_out_rms=%.6f shared_gate=%.6f h_mid_rms=%.6f\n",
+                    vec_rms(moe_out, cfg.hidden_dim), vec_rms(shared_out, cfg.hidden_dim),
+                    shared_weight, vec_rms(g_deferred.h_mid, cfg.hidden_dim));
+        }
         for (int i = 0; i < cfg.hidden_dim; i++) {
             shared_out[i] *= shared_weight;
         }
@@ -5291,6 +5323,11 @@ static void finalize_deferred_experts(void) {
         // Final combine: hidden = h_mid + moe_out + shared_out
         for (int i = 0; i < cfg.hidden_dim; i++) {
             g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
+        }
+        if (g_deferred.layer_idx == 0) {
+            fprintf(stderr, "[MOE-GPU] layer=0 hidden_after_moe_rms=%.6f first3=[%.6f,%.6f,%.6f]\n",
+                    vec_rms(g_deferred.hidden, cfg.hidden_dim),
+                    g_deferred.hidden[0], g_deferred.hidden[1], g_deferred.hidden[2]);
         }
     }
 
@@ -5817,6 +5854,11 @@ static void fused_layer_forward(
 
         // Check cache for each predicted expert, start async I/O for misses
         size_t spec_esz = active_expert_size();
+        if (layer_idx == 0) {
+            fprintf(stderr, "[MOE-BRANCH] layer=0 packed_fd=%d packed_mode=%d cache=%p malloc_cache=%p pred_started=%d use_lz4=%d async_active=%d\n",
+                    packed_fd, g_packed_ssd_mode, (void *)g_expert_cache, (void *)g_malloc_cache,
+                    pred_started, g_use_lz4, g_async_pread.active);
+        }
         if (g_malloc_cache) {
             spec_group = dispatch_group_create();
             for (int k = 0; k < spec_K; k++) {
@@ -5838,7 +5880,7 @@ static void fused_layer_forward(
                     }
                 }
             }
-        } else if (g_expert_cache) {
+        } else if (g_expert_cache && g_expert_cache->num_entries > 0) {
             spec_group = dispatch_group_create();
             for (int k = 0; k < spec_K; k++) {
                 int eidx = s_spec_indices[k];
@@ -5993,6 +6035,7 @@ static void fused_layer_forward(
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ);
+
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -6835,7 +6878,7 @@ static void fused_layer_forward(
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
-    if ((packed_fd >= 0 || g_packed_ssd_mode || g_slot_bank) && g_metal && g_metal->buf_multi_expert_data[0]) {
+    if ((packed_fd >= 0 || g_packed_ssd_mode) && g_metal && g_metal->buf_multi_expert_data[0]) {
         // GPU multi-expert path with LRU cache + parallel I/O:
         // For each expert:
         //   - Cache HIT:  dispatch directly from cached Metal buffer (skip pread)
@@ -6845,18 +6888,7 @@ static void fused_layer_forward(
         int valid[MAX_K];
         id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
 
-        if (g_slot_bank) {
-            SlotBankResult r = [g_slot_bank loadLayer:layer_idx expertIds:expert_indices count:actual_K];
-            for (int k = 0; k < actual_K; k++) {
-                int slotIdx = r.slotIds[k];
-                void *slotPtr = [g_slot_bank bufferPointerForSlot:slotIdx];
-                expert_bufs[k] = [g_metal->device newBufferWithBytesNoCopy:slotPtr
-                                                                   length:active_expert_size()
-                                                                  options:MTLResourceStorageModeShared
-                                                              deallocator:nil];
-                valid[k] = (slotPtr != NULL);
-            }
-        } else if (g_malloc_cache) {
+        if (g_malloc_cache) {
             // ---- Malloc cache path (zero-copy Metal buffer wrappers) ----
             // Phase 1: check cache for each expert, collect misses
             int miss_indices[MAX_K];
@@ -6896,10 +6928,12 @@ static void fused_layer_forward(
                     off_t offset = expert_file_offset(layer_idx, expert_indices[k], esz);
                     void *dst = g_malloc_cache->data[cidx];
                     if (g_expert_ram_base) {
+                        // RAM mode: memcpy from preloaded experts (~0.1ms per expert)
                         void *src = (uint8_t *)g_expert_ram_base + offset;
                         memcpy(dst, src, esz);
                         valid[k] = 1;
                     } else {
+                        // SSD mode: pread from disk (~1.5ms per expert)
                         int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                         ssize_t r = pread(fd, dst, esz, offset);
                         valid[k] = (r == (ssize_t)esz);
@@ -7043,12 +7077,21 @@ static void fused_layer_forward(
                 valid[k] = (tasks[k].result == (ssize_t)esz);
             }
         } else {
-            // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
-            async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base,
-                              layer_idx);
+            // ---- No cache, no prediction, no LZ4: synchronous direct pread ----
+            // The async path can leave entries[k].done unset in this configuration,
+            // which zeroes routed MoE contributions. Use direct pread here for correctness.
+            size_t esz = active_expert_size();
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+                int fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                void *dst = [expert_bufs[k] contents];
+                off_t off = expert_file_offset(layer_idx, expert_indices[k], esz);
+                ssize_t r = pread(fd, dst, esz, off);
+                valid[k] = (r == (ssize_t)esz);
+                if (!valid[k]) {
+                    fprintf(stderr, "WARNING: direct expert pread layer=%d expert=%d got %zd/%zu errno=%d/%s\n",
+                            layer_idx, expert_indices[k], r, esz, errno, strerror(errno));
+                }
             }
         }
 
@@ -7065,13 +7108,15 @@ static void fused_layer_forward(
             for (int k = 0; k < actual_K; k++) {
                 valid[k] = g_async_pread.entries[k].done;
             }
+            if (layer_idx == 0) {
+                fprintf(stderr, "[MOE-ASYNC] layer=0 done0=%d done1=%d gen=%d active=%d\n",
+                        actual_K > 0 ? g_async_pread.entries[0].done : -1,
+                        actual_K > 1 ? g_async_pread.entries[1].done : -1,
+                        g_async_pread.generation, g_async_pread.active);
+            }
         }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
-
-        if (g_slot_bank && g_pred_enabled && g_pred_generating) {
-            [g_slot_bank prefetchLayer:layer_idx expertIds:expert_indices count:actual_K];
-        }
 
         // Store this layer's routing for next token's temporal prediction.
         // MUST happen AFTER the prediction hit check above (which reads g_pred_experts).
@@ -7110,6 +7155,16 @@ static void fused_layer_forward(
             }
         }
 
+        if (layer_idx == 0) {
+            fprintf(stderr, "[MOE-ROUTE] layer=0 actual_K=%d idx0=%d w0=%.6f v0=%d idx1=%d w1=%.6f v1=%d\n",
+                    actual_K,
+                    actual_K > 0 ? expert_indices[0] : -1,
+                    actual_K > 0 ? expert_weights[0] : 0.0f,
+                    actual_K > 0 ? valid[0] : -1,
+                    actual_K > 1 ? expert_indices[1] : -1,
+                    actual_K > 1 ? expert_weights[1] : 0.0f,
+                    actual_K > 1 ? valid[1] : -1);
+        }
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
@@ -7150,12 +7205,7 @@ static void fused_layer_forward(
         // This makes CMD3 self-contained: it produces buf_input for the next layer's CMD1.
         // The next layer skips deferred_wait + finalize + input_norm entirely at layer start.
 
-        int gpu_combine = (g_metal->moe_combine_residual &&
-                           g_metal->rms_norm_sum &&
-                           g_metal->rms_norm_apply_bf16 &&
-                           g_metal->wf_buf &&
-                           layer_idx < cfg.num_layers - 1 &&
-                           layer_cache[layer_idx + 1].input_norm_w != NULL);
+        int gpu_combine = 0;  // temporarily disabled for MoE verification
 
         if (gpu_combine) {
             // Copy h_mid from buf_h_mid (populated by CMD2) — it's still valid on GPU.
@@ -7344,6 +7394,14 @@ static void fused_layer_forward(
             cpu_swiglu(gate_proj_out, up_proj_out, act_out, cfg.moe_intermediate);
             cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
                                cfg.hidden_dim, cfg.moe_intermediate, cfg.group_size);
+            if (layer_idx == 0 && k == 0) {
+                fprintf(stderr, "[MOE-LIVE] layer=0 expert=%d w=%.6f gate_rms=%.6f up_rms=%.6f act_rms=%.6f out_rms=%.6f\n",
+                        eidx, expert_weights[k],
+                        vec_rms(gate_proj_out, cfg.moe_intermediate),
+                        vec_rms(up_proj_out, cfg.moe_intermediate),
+                        vec_rms(act_out, cfg.moe_intermediate),
+                        vec_rms(expert_out_cpu, cfg.hidden_dim));
+            }
 
             free(gate_proj_out);
             free(up_proj_out);
@@ -7380,6 +7438,11 @@ static void fused_layer_forward(
     }
 
     // ---- Final combine: hidden = h_mid + moe_out + shared_out ----
+    if (layer_idx == 0) {
+        fprintf(stderr, "[MOE-LIVE] layer=0 moe_out_rms=%.6f shared_out_rms=%.6f shared_gate=%.6f h_mid_rms=%.6f\n",
+                vec_rms(moe_out, cfg.hidden_dim), vec_rms(shared_out, cfg.hidden_dim),
+                shared_weight, vec_rms(h_mid, cfg.hidden_dim));
+    }
     for (int i = 0; i < cfg.hidden_dim; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
     }
@@ -7737,13 +7800,13 @@ static int sse_send_keepalive(int fd) {
     return 0;
 }
 
-static void sse_send_done(int fd, const char *request_id) {
+static void sse_send_done(int fd, const char *request_id, const char *finish_reason) {
     char chunk[1024];
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
-        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n"
         "data: [DONE]\n\n",
-        request_id);
+        request_id, finish_reason ? finish_reason : "stop");
 
     int sent = 0;
     while (sent < n) {
@@ -7769,34 +7832,39 @@ static const char *CORS_RESPONSE =
     "Access-Control-Max-Age: 86400\r\n"
     "\r\n";
 
+static const char *qwen_assistant_prefill(int enable_thinking) {
+    return enable_thinking
+        ? "<|im_start|>assistant\n"
+        : "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+}
+
 // Tokenize a user turn (system prompt already cached in KV).
-// Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+// Encodes: <|im_start|>user\n{content}<|im_end|>\n + assistant prefill matching Qwen semantics.
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n";
+    const char *assistant_prefill = qwen_assistant_prefill(g_allow_thinking);
 
-    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
+    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + strlen(assistant_prefill) + 1;
     char *prompt = malloc(prompt_len);
     if (!prompt) return NULL;
-    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    snprintf(prompt, prompt_len, "%s%s%s%s", prefix, user_content, suffix, assistant_prefill);
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
 }
 
 // Tokenize a continuation turn for session caching.
-// Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
-// Used when the KV cache already contains the prior conversation state.
+// Prefixes with a newline to continue after a generated <|im_end|>, then adds user turn + assistant prefill.
 static PromptTokens *tokenize_continuation_turn(const char *user_content) {
-    // EOS/<|im_end|> is already in the state (fed through model at end of generation)
-    // Just need the newline + new user turn + assistant prompt
     const char *prefix = "\n<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n";
+    const char *assistant_prefill = qwen_assistant_prefill(g_allow_thinking);
 
-    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
+    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + strlen(assistant_prefill) + 1;
     char *prompt = malloc(prompt_len);
     if (!prompt) return NULL;
-    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    snprintf(prompt, prompt_len, "%s%s%s%s", prefix, user_content, suffix, assistant_prefill);
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -7821,7 +7889,7 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant. Answer directly and naturally.");
 }
 
 // Tokenize ONLY the system prompt (for KV cache snapshot).
@@ -7846,32 +7914,14 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
     if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
 
-    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+    const char *assistant_prefill = qwen_assistant_prefill(g_allow_thinking);
     size_t sys_len = strlen(sys_prompt_text);
     size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
+    size_t total = 30 + sys_len + 30 + user_len + strlen(assistant_prefill) + 16;
     char *prompt = malloc(total);
     if (!prompt) return NULL;
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-             sys_prompt_text, user_content);
-    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
-    free(prompt);
-    return pt;
-}
-
-// Keep old signature for backward compat (unused but prevents compiler warning)
-__attribute__((unused))
-static PromptTokens *tokenize_chat_message_old(const char *user_content) {
-    const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
-        "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
-
-    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
-    char *prompt = malloc(prompt_len);
-    if (!prompt) return NULL;
-
-    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n%s",
+             sys_prompt_text, user_content, assistant_prefill);
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -7968,7 +8018,7 @@ static void serve_loop(
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
             }
-            discard_deferred_experts();
+            complete_deferred_experts();
             sys_pos++;
         }
         // Last system prompt token: full completion
@@ -8161,7 +8211,7 @@ static void serve_loop(
                     is_continuation ? " [CONTINUE]" : " [NEW]");
 
             // ---- Tokenize ----
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
+            // Continuation: prior assistant <|im_end|> is already in state; prefix only a newline before the next user turn
             // New session: just the user turn (system prompt restored from snapshot)
             PromptTokens *pt;
             if (is_continuation) {
@@ -8319,7 +8369,7 @@ static void serve_loop(
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                         serve_prefill_k, layer_fds[layer]);
                 }
-                discard_deferred_experts();
+                complete_deferred_experts();
                 pos++;
             }
             // Last prefill token: full completion (need hidden for logits)
@@ -8371,6 +8421,7 @@ static void serve_loop(
             int in_think = 0;
             int think_tokens = 0;
             int client_alive = 1;
+            const char *finish_reason = "length";
             int prev_token = -1;
             int repeat_run = 0;
 
@@ -8392,7 +8443,7 @@ static void serve_loop(
                     }
                 }
 
-                if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
+                if (is_eos_token(next_token)) {
                     // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
                     embed_lookup(wf, next_token, hidden);
@@ -8407,6 +8458,7 @@ static void serve_loop(
                     }
                     discard_deferred_experts();
                     pos++;
+                    finish_reason = "stop";
                     break;
                 }
 
@@ -8424,17 +8476,18 @@ static void serve_loop(
                 const char *tok_str = decode_token(vocab, next_token);
 
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256 * 1024 - 1) {
+                if (should_emit_visible_token(next_token, in_think) && tok_str && gen_resp_len + (int)strlen(tok_str) < 256 * 1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
 
-                if (tok_str && tok_str[0]) {
+                if (should_emit_visible_token(next_token, in_think) && tok_str && tok_str[0]) {
                     if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
                         fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                         client_alive = 0;
+                        finish_reason = "cancelled";
                         break;
                     }
                 }
@@ -8464,21 +8517,21 @@ static void serve_loop(
                 }
 
                 lm_head_forward(wf, hidden, logits);
-                next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
-                                            : cpu_argmax(logits, cfg.vocab_size);
+                next_token = (g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size) : cpu_argmax(logits, cfg.vocab_size));
 
                 // Optional light keepalive every 32 tokens
                 if ((gen_count & 31) == 0) {
                     if (sse_send_keepalive(client_fd) < 0) {
                         fprintf(stderr, "[serve] %s client disconnected during keepalive\n", request_id);
                         client_alive = 0;
+                        finish_reason = "cancelled";
                         break;
                     }
                 }
             }
 
-            if (client_alive) {
-                sse_send_done(client_fd, request_id);
+            if (client_alive && strcmp(finish_reason, "cancelled") != 0) {
+                sse_send_done(client_fd, request_id, finish_reason);
             }
 
             // ---- Save session state ----
@@ -8553,8 +8606,6 @@ static void print_usage(const char *prog) {
     printf("  --cache-mb N         Expert cache budget in MB (converts to entries automatically)\n");
     printf("  --cache-composite    A2: Use composite eviction (LRU + frequency) instead of pure LRU\n");
     printf("  --offload-ssd PATH   Enable expert offload staging buffer (path to packed_experts dir or .bin file)\n");
-    printf("  --experts-dir PATH   Per-layer expert export dir (default: experts_122b/)\n");
-    printf("  --slot-bank-size N   SlotBank slots (default: 32)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -8569,8 +8620,9 @@ static void print_usage(const char *prog) {
     printf("  --warmup-profile F   Pre-warm frequent experts from profile file at startup\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --allow-thinking     Allow <think> token generation in CLI inference\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
-    printf("  --sample             Enable temperature sampling (default: greedy/argmax)\n");
+    printf("  --sample             Enable temperature sampling (default for --chat/Qwen mode)\n");
     printf("  --temperature F      Sampling temperature (default: 0.6)\n");
     printf("  --top-k N            Top-k sampling (default: 20, 0=disabled)\n");
     printf("  --top-p F            Top-p/nucleus sampling (default: 0.95)\n");
@@ -8589,6 +8641,7 @@ int main(int argc, char **argv) {
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
+        int prompt_chat = 0;
         int max_tokens = 20;
         int K = -1;  // -1 = use config's num_experts_per_tok
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
@@ -8603,6 +8656,7 @@ int main(int argc, char **argv) {
             {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
+            {"chat",          no_argument,       0, 288},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
             {"cache-entries",  required_argument, 0, 'C'},
@@ -8615,6 +8669,7 @@ int main(int argc, char **argv) {
             {"2bit",          no_argument,       0, '2'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
+            {"allow-thinking", no_argument,       0, 289},
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
@@ -8644,8 +8699,6 @@ int main(int argc, char **argv) {
             {"cache-mb",      required_argument, 0, 277},
             {"cache-composite", no_argument,     0, 278},
             {"offload-ssd",   required_argument, 0, 280},
-            {"experts-dir",   required_argument, 0, 288},
-            {"slot-bank-size", required_argument, 0, 289},
             {"preload-ram",  no_argument,       0, 287},
             {"phase-aware-prefetch", no_argument, 0, 281},
             {"aio-depth",     required_argument, 0, 282},
@@ -8666,6 +8719,7 @@ int main(int argc, char **argv) {
                 case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
+                case 288: prompt_chat = 1; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
@@ -8686,6 +8740,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
+                case 289: g_allow_thinking = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'A': g_car_dry = 1; break;
                 case 256: g_car_threshold = strtof(optarg, NULL); break;
@@ -8834,15 +8889,6 @@ int main(int argc, char **argv) {
                     printf("[config] Expert offload: enabled (SSD: %s)\n", g_offload_ssd_path);
                     break;
                 }
-                case 288:
-                    g_experts_dir = strdup(optarg);
-                    printf("[config] Experts dir: %s\n", g_experts_dir);
-                    break;
-                case 289:
-                    g_slot_bank_size = atoi(optarg);
-                    if (g_slot_bank_size < 1) g_slot_bank_size = 32;
-                    printf("[config] SlotBank size: %d\n", g_slot_bank_size);
-                    break;
                 case 281:
                     // --phase-aware-prefetch: after attention RMSNorm, prefetch next layer's experts
                     g_phase_aware_prefetch = 1;
@@ -9089,6 +9135,12 @@ int main(int argc, char **argv) {
             prompt_tokens_path = default_prompt_tokens;
         }
 
+        // Qwen chat models expect stochastic decoding in normal assistant mode.
+        // Greedy remains available for debugging, but chat CLI defaults to Qwen sampling.
+        if (prompt_chat && !g_use_sampling) {
+            g_use_sampling = 1;
+        }
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -9099,18 +9151,7 @@ int main(int argc, char **argv) {
         io_pool_init();
         infer_prefetch_init();
 
-        // ---- Initialize expert sources ----
-        if (!g_experts_dir) {
-            g_experts_dir = strdup("experts_122b");
-        }
-        if (g_experts_dir) {
-            g_slot_bank = [[SlotBank alloc] initWithExpertsDir:[NSString stringWithUTF8String:g_experts_dir]
-                                                   numLayers:cfg.num_layers
-                                                  expertSize:cfg.expert_size_4bit
-                                                       maxK:cfg.num_experts
-                                                cacheIOSplit:0];
-            [g_slot_bank setSlotBankSize:g_slot_bank_size];
-        }
+        // ---- Initialize expert offload SSD staging buffer (if requested) ----
         if (g_offload_enabled && g_offload_ssd_path) {
             if (expert_offload_init(g_offload_ssd_path) != 0) {
                 fprintf(stderr, "WARNING: expert_offload_init failed, continuing without offload\n");
@@ -9145,7 +9186,7 @@ int main(int argc, char **argv) {
                    g_sampling_temperature, g_sampling_top_k, g_sampling_top_p);
             srand((unsigned int)time(NULL));  // Initialize random seed
         } else {
-            printf("Sampling: greedy (use --sample for temperature sampling)\n");
+            printf("Sampling: greedy\n");
         }
         printf("Matvec:   GPU-first\n");
         printf("\n");
@@ -9221,10 +9262,14 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "ERROR: Failed to process prompt escape sequences\n");
                     return 1;
                 }
-                pt = encode_prompt_text_to_tokens(processed_prompt);
+                if (prompt_chat) {
+                    pt = tokenize_chat_message(processed_prompt);
+                } else {
+                    pt = encode_prompt_text_to_tokens(processed_prompt);
+                }
                 free(processed_prompt);
                 if (!pt) {
-                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    fprintf(stderr, "ERROR: Failed to encode prompt.\n");
                     return 1;
                 }
             } else if (!prompt_tokens_path) {
@@ -9524,9 +9569,10 @@ int main(int argc, char **argv) {
                                         prefill_k, layer_fds[layer]);
                 }
 
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
-                discard_deferred_experts();
+                // Complete deferred experts during prefill.
+                // MoE outputs affect the prompt-conditioned hidden/state evolution;
+                // discarding them corrupts prompt conditioning for generation.
+                complete_deferred_experts();
                 pos++;
 
                 if (token_idx == 0) {
@@ -9585,38 +9631,29 @@ int main(int argc, char **argv) {
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
-        int next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
-                                        : cpu_argmax(logits, cfg.vocab_size);
+        int next_token = (g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size) : cpu_argmax(logits, cfg.vocab_size));
         double ttft_ms = now_ms() - t0;
 
-        // Debug: show top-5 logits for first token
-        {
-            // Find top 5 manually
-            int top5[5] = {0,0,0,0,0};
-            float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
-            for (int i = 0; i < cfg.vocab_size; i++) {
-                int min_k = 0;
-                for (int k = 1; k < 5; k++) if (topv[k] < topv[min_k]) min_k = k;
-                if (logits[i] > topv[min_k]) { topv[min_k] = logits[i]; top5[min_k] = i; }
-            }
-            fprintf(stderr, "[debug] Top 5 logits (next_token=%d):\n", next_token);
-            for (int i = 0; i < 5; i++) {
-                fprintf(stderr, "  token %d (\"%s\") logit=%.4f\n",
-                        top5[i], decode_token(vocab, top5[i]), topv[i]);
-            }
-            fprintf(stderr, "[debug] hidden rms after final_norm=%.4f, logits rms=%.4f\n",
-                    vec_rms(hidden, cfg.hidden_dim), vec_rms(logits, cfg.vocab_size));
-        }
         printf("[ttft] %.0f ms (prefill %d tokens + lm_head %.0f ms)\n",
                ttft_ms, pt->count, lm_ms);
 
         printf("\n--- Output ---\n");
-        printf("%s", decode_token(vocab, next_token));
-        fflush(stdout);
 
-        int total_generated = 1;
-        int in_think = (next_token == cfg.think_start_token) ? 1 : 0;
+        int total_generated = 0;
+        int in_think = 0;
         int think_tokens = 0;
+
+        if (next_token == cfg.think_start_token) in_think = 1;
+        if (next_token == cfg.think_end_token) in_think = 0;
+
+        if (!is_eos_token(next_token)) {
+            if (in_think) think_tokens = 1;
+            total_generated = 1;
+            if (should_emit_visible_token(next_token, in_think)) {
+                printf("%s", decode_token(vocab, next_token));
+                fflush(stdout);
+            }
+        }
 
         // ---- Auto-regressive generation ----
         if (g_timing_enabled) timing_reset();
@@ -9628,7 +9665,7 @@ int main(int argc, char **argv) {
             double t_gen_start = now_ms();
 
             // Check EOS
-            if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
+            if (is_eos_token(next_token)) {
                 fprintf(stderr, "\n[eos] Token %d at position %d\n", next_token, gen);
                 break;
             }
@@ -9668,8 +9705,7 @@ int main(int argc, char **argv) {
             lm_head_forward(wf, hidden, logits);
 
             // Sample next token (greedy or temperature sampling)
-            next_token = g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size)
-                                        : cpu_argmax(logits, cfg.vocab_size);
+            next_token = (g_use_sampling ? cpu_sample_top_k_p(logits, cfg.vocab_size) : cpu_argmax(logits, cfg.vocab_size));
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget >= 0 && think_tokens >= g_think_budget) {
@@ -9678,9 +9714,11 @@ int main(int argc, char **argv) {
             }
             total_generated++;
 
-            // Print decoded token
-            printf("%s", decode_token(vocab, next_token));
-            fflush(stdout);
+            // Print decoded token if it belongs to visible answer text
+            if (should_emit_visible_token(next_token, in_think)) {
+                printf("%s", decode_token(vocab, next_token));
+                fflush(stdout);
+            }
 
             double t_gen_end = now_ms();
             double tok_time = t_gen_end - t_gen_start;
